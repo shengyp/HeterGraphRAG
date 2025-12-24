@@ -1,0 +1,44 @@
+# Minimal config for your current IG-RWR Multi-hop RAG codebase (actually used fields only)
+
+coarse_retrieval:
+  top_k_dense: 100
+  top_k_final: 50
+  lambda_dense: 1.0
+  lambda_sparse: 0.0
+  ollama_base_url: "http://localhost:11434"
+
+graph_construction:
+
+  entity_similarity_threshold: 0.8
+  concept_num_clusters: 20
+  proposition_similarity_threshold: 0.7
+  concept_similarity_threshold: 0.75
+  summary_similarity_threshold: 0.7
+  ollama_base_url: "http://localhost:11434"
+  llm_model: "qwen2.5:14b"
+
+subgraph:
+  hops: 2
+
+semantic_anchor:
+  tau_sem: 0.25
+  top_k_fallback: 5
+  llm_model: "qwen2.5:14b"
+  ollama_base_url: "http://localhost:11434"
+
+structural_centrality:
+  alpha_core: 0.5
+  alpha_betw: 0.5
+  k0: 10
+
+intent_representation:
+  ollama_base_url: "http://localhost:11434"
+  llm_model: "qwen2.5:14b"
+
+answer_generation:
+  k_c: 5
+  k_p: 3
+  k_z: 2
+  k_s: 2
+  llm_model: "qwen2.5:14b"
+  ollama_base_url: "http://localhost:11434"
