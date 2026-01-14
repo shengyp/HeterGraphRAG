@@ -1,18 +1,6 @@
-"""
-RAG系统主类 - 简化版
-
-流程：
-1. 离线构建全局图 G_global
-2. 粗检得到chunk集合 C_q
-3. 从C_q做2-hop扩展得到子图 G_q
-4. 在G_q上做LLM语义锚点选择
-5. 在G_q上做结构中心度排序
-6. 取top节点及1-hop邻居送入LLM
-"""
-
 import logging
 import pickle
-from typing import Dict, List
+from typing import Dict, List, Any
 import networkx as nx
 
 from src.bgem3_retriever import BGEM3Retriever
@@ -26,225 +14,413 @@ logger = logging.getLogger(__name__)
 
 
 class RAGSystem:
-    """RAG系统 - 基于异构图的多跳问答系统"""
-    
-    def __init__(self, config: Dict):
-        """初始化RAG系统"""
-        self.config = config
-        self.global_graph = None  # 全局图 G_global
+    """
+    最终流程：
+    1) 粗检 -> candidate chunk_ids
+    2) 从 chunk_ids 在全图中做 2-hop -> 子图 G_q
+    3) 只在子图 G_q 上做语义锚点评分，阈值 >= 0.25 选 anchors
+    4) 只对这些 anchors，在全图上做结构分排序
+       chunk=6 proposition=6 concept=3 summary=3
+    5) 对每个 chunk anchor 做邻居扩展（4P/2Z/1S/2相似chunk跨doc）
+    6) 把所有选中的节点按类型组织，送给 AnswerGenerator
+    """
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config or {}
+        self.global_graph = None
+
+        logger.info("初始化RAGSystem...")
+
         
-        # 初始化模块
-        logger.info("初始化RAG系统...")
-        
-        self.bgem3_retriever = BGEM3Retriever(config.get("coarse_retrieval", {}))
-        self.graph_builder = GraphBuilder(config.get("graph_construction", {}))
-        self.intent_repr = IntentRepresentation(config.get("intent_representation", {}))
-        self.anchor_selector = SemanticAnchorSelector(config.get("semantic_anchor", {}))
-        self.centrality_ranker = StructuralCentralityRanker(config.get("structural_centrality", {}))
-        self.answer_generator = AnswerGenerator(config.get("answer_generation", {}))
-        
-        logger.info("RAG系统初始化完成")
-    
-    def build_global_graph(self, documents: List[Dict]):
-        """
-        离线构建全局图 G_global
-        
-        Args:
-            documents: 预处理后的文档列表（包含chunks, propositions, concepts, summaries）
-        """
-        logger.info(f"开始构建全局图: {len(documents)} 个文档")
-        
-        # 使用graph_builder构建异构图
-        self.global_graph = self.graph_builder.build_heterogeneous_graph(documents)
-        
-        logger.info(f"全局图构建完成: {self.global_graph.number_of_nodes()} 节点, {self.global_graph.number_of_edges()} 边")
-    
+        self.bgem3_retriever = BGEM3Retriever(self.config.get("coarse_retrieval", {}) or {})
+
+        # GraphBuilder：只有离线建图才需要
+        self.graph_builder = None
+        graph_cfg = self.config.get("graph_construction", {}) or {}
+        try:
+            required = [
+                "entity_similarity_threshold",
+                "concept_num_clusters",
+                "proposition_similarity_threshold",
+                "concept_similarity_threshold",
+                "summary_similarity_threshold",
+                "ollama_base_url",
+                "llm_model",
+            ]
+            ok = True
+            for k in required:
+                if k not in graph_cfg:
+                    ok = False
+                    break
+            if ok:
+                self.graph_builder = GraphBuilder(graph_cfg)
+            else:
+                logger.info("GraphBuilder skipped")
+        except Exception as e:
+            logger.warning("GraphBuilder init failed, skip: %s", e)
+            self.graph_builder = None
+
+        #其他配置读取
+        self.intent_repr = IntentRepresentation(self.config.get("intent_representation", {}) or {})
+        self.anchor_selector = SemanticAnchorSelector(self.config.get("semantic_anchor", {}) or {})
+        self.centrality_ranker = StructuralCentralityRanker(self.config.get("structural_centrality", {}) or {})
+        self.answer_generator = AnswerGenerator(self.config.get("answer_generation", {}) or {})
+
+        # subgraph hops
+        sub_cfg = self.config.get("subgraph", {}) or {}
+        self.subgraph_hops = int(sub_cfg.get("hops", 2))
+
+        logger.info("RAGSystem初始化完成.")
+
+    # -------------------------
+    # Graph I/O
+    # -------------------------
+    #开始构图
+    def build_global_graph(self, chunks):
+        if self.graph_builder is None:
+            raise RuntimeError("图构建器还没有构建好")
+
+        logger.info("开始构建全局图: chunks=%d", len(chunks))
+        self.global_graph = self.graph_builder.build_heterogeneous_graph(chunks)
+        logger.info("全局图构建完成: nodes=%d edges=%d", self.global_graph.number_of_nodes(), self.global_graph.number_of_edges())
+    #保存为pkl
     def save_global_graph(self, path: str):
-        """保存全局图"""
-        with open(path, 'wb') as f:
+        with open(path, "wb") as f:
             pickle.dump(self.global_graph, f)
-        logger.info(f"全局图已保存: {path}")
-    
+        logger.info("全局图已保存: %s", path)
+    #加载的函数
     def load_global_graph(self, path: str):
-        """加载全局图"""
-        with open(path, 'rb') as f:
+        with open(path, "rb") as f:
             self.global_graph = pickle.load(f)
-        logger.info(f"全局图已加载: {self.global_graph.number_of_nodes()} 节点")
-    
-    def index_documents(self, documents: List[Dict]):
-        """
-        为文档建立索引（用于粗检）
-        
-        Args:
-            documents: 文档列表
-        """
-        logger.info(f"开始索引文档: {len(documents)} 个文档")
+        logger.info("全局图已加载: nodes=%d", self.global_graph.number_of_nodes())
+
+    # -------------------------
+    # Index build
+    # -------------------------
+    #文档级别的构建，用于粗检
+    def index_documents(self, documents: List[Dict[str, Any]]):
+        logger.info("开始索引文档: %d", len(documents))
         self.bgem3_retriever.build_doc_index(documents)
         logger.info("文档索引完成")
-    
-    def query(self, query: str) -> Dict:
-        """
-        执行完整的RAG查询流程
-        
-        流程：
-        1. 粗检：BGE-M3检索得到chunk集合 C_q
-        2. 2-hop扩展：从C_q在G_global中扩展得到子图 G_q
-        3. 意图表征：构建意图向量
-        4. 语义锚点选择：在G_q上选择锚点
-        5. 结构中心度排序：在G_q上排序锚点
-        6. 答案生成：取top节点及1-hop邻居送入LLM
-        
-        Args:
-            query: 查询文本
-            
-        Returns:
-            {
-                "answer": "答案文本",
-                "supporting_nodes": {...},
-                "metadata": {...}
-            }
-        """
-        logger.info(f"\n{'='*60}")
-        logger.info(f"开始RAG查询: {query}")
-        logger.info(f"{'='*60}\n")
-        
-        # 1. 粗检：BGE-M3检索
-        logger.info("步骤1: BGE-M3粗检")
+
+    # -------------------------
+    # Query
+    # -------------------------
+    def query(self, query):
+        if self.global_graph is None:
+            raise RuntimeError("图为空")
+
+        logger.info("=" * 60)
+        logger.info("开始查询: %s", query)
+        logger.info("=" * 60)
+
+        # 1) 粗检
         candidate_docs = self.bgem3_retriever.hybrid_doc_retrieval(query)
-        
-        # 提取chunk集合 C_q
-        chunk_ids = []
+
         candidate_chunks = []
+        chunk_ids = []
         for doc in candidate_docs:
-            if "chunks" in doc and doc["chunks"]:
-                for chunk in doc["chunks"]:
-                    chunk_ids.append(chunk["id"])
-                    candidate_chunks.append(chunk)
-        
-        logger.info(f"粗检完成: {len(candidate_docs)} 个文档, {len(chunk_ids)} 个chunks")
-        
-        # 2. 2-hop扩展：从C_q得到子图 G_q
-        logger.info("\n步骤2: 2-hop子图扩展")
-        G_q = self._extract_subgraph(chunk_ids, hops=2)
-        logger.info(f"子图提取完成: {G_q.number_of_nodes()} 节点, {G_q.number_of_edges()} 边")
-        
-        # 3. 意图表征
-        logger.info("\n步骤3: 意图表征")
+            chunks = doc.get("chunks") or []
+            for ch in chunks:
+                cid = ch.get("id")
+                if cid:
+                    chunk_ids.append(cid)
+                    candidate_chunks.append(ch)
+
+        logger.info("粗检: docs=%d chunks=%d", len(candidate_docs), len(chunk_ids))
+
+        # 2) 子图 G_q（2-hop）
+        G_q = self._extract_subgraph(chunk_ids, hops=self.subgraph_hops)
+        logger.info("子图: nodes=%d edges=%d", G_q.number_of_nodes(), G_q.number_of_edges())
+
+        # 3) 意图
         h_intent, intent_type = self.intent_repr.build_intent_vector(query, candidate_chunks)
-        logger.info(f"意图表征完成: intent_type={intent_type}")
-        
-        # 4. 语义锚点选择（在子图G_q上）
-        logger.info("\n步骤4: 语义锚点选择")
-        s_sem = self.anchor_selector.select_semantic_anchors(G_q, query, h_intent, intent_type)
-        
-        # 获取超过阈值的锚点
-        tau_sem = self.config.get("semantic_anchor", {}).get("tau_sem", 0.25)
-        anchor_candidates = [nid for nid, score in s_sem.items() if score >= tau_sem]
-        
-        # Top-K保底
+        logger.info("intent_type=%s", intent_type)
+
+        # 4) 语义锚点：只在子图上打分
+        sem_result = self.anchor_selector.select_semantic_anchors(G_q, query, h_intent, intent_type)
+        s_sem = sem_result["scores"]
+
+        tau_sem = float((self.config.get("semantic_anchor", {}) or {}).get("tau_sem", 0.25))
+        anchor_candidates = []
+        for nid, sc in s_sem.items():
+            if sc >= tau_sem:
+                anchor_candidates.append(nid)
+
+        # 全局保底（子图内）
         if not anchor_candidates:
-            top_k = self.config.get("semantic_anchor", {}).get("top_k_fallback", 10)
-            sorted_nodes = sorted(s_sem.items(), key=lambda x: x[1], reverse=True)
-            anchor_candidates = [nid for nid, score in sorted_nodes[:top_k]]
-        
-        logger.info(f"语义锚点选择完成: {len(anchor_candidates)} 个候选锚点")
-        
-        # 5. 结构中心度排序（在全局图G_global上）
-        logger.info("\n步骤5: 结构中心度排序（在全局图上）")
-        top_anchors = self.centrality_ranker.rank_anchor_nodes(self.global_graph, anchor_candidates, s_sem)
-        logger.info(f"锚点排序完成: {len(top_anchors)} 个top锚点")
-        
-        # 6. 收集节点及1-hop邻居（在全局图上）
-        logger.info("\n步骤6: 收集上下文节点（在全局图上）")
-        context_nodes = set(top_anchors)
-        
-        # 添加1-hop邻居（从全局图）
-        for node_id in top_anchors:
-            if self.global_graph.has_node(node_id):
-                neighbors = list(self.global_graph.neighbors(node_id))
-                context_nodes.update(neighbors)
-        
-        logger.info(f"上下文节点: {len(context_nodes)} 个（包含1-hop邻居）")
-        
-        # 构建ranked_nodes格式（用于答案生成）
+            top_k = int((self.config.get("semantic_anchor", {}) or {}).get("top_k_fallback", 10))
+            items = list(s_sem.items())
+            items.sort(key=lambda x: x[1], reverse=True)
+            anchor_candidates = [nid for nid, _ in items[:top_k]]
+
+        logger.info("语义锚点候选(子图): %d", len(anchor_candidates))
+
+        # 5) 结构排序：只对这些 anchors，在全图上排序（设计A：按类型截断）
+        top_by_type = self.centrality_ranker.rank_anchor_nodes(self.global_graph, anchor_candidates, s_sem)
+
+        chunk_anchors = top_by_type["chunk"]
+        prop_anchors = top_by_type["proposition"]
+        concept_anchors = top_by_type["concept"]
+        summary_anchors = top_by_type["summary"]
+
+        logger.info("结构排序结果: chunk=%d prop=%d concept=%d summary=%d",
+                    len(chunk_anchors), len(prop_anchors), len(concept_anchors), len(summary_anchors))
+
+        # 6) 邻居扩展
+        expanded = self._expand_from_chunk_anchors(chunk_anchors, s_sem)
+
+        # 7) 合并所有节点（锚点 + 扩展）
+        all_chunks = set()
+        all_props = set()
+        all_concepts = set()
+        all_summaries = set()
+
+        # 先把结构锚点都加进去
+        for nid in chunk_anchors:
+            all_chunks.add(nid)
+        for nid in prop_anchors:
+            all_props.add(nid)
+        for nid in concept_anchors:
+            all_concepts.add(nid)
+        for nid in summary_anchors:
+            all_summaries.add(nid)
+
+        # 再加扩展
+        for nid in expanded["chunk"]:
+            all_chunks.add(nid)
+        for nid in expanded["proposition"]:
+            all_props.add(nid)
+        for nid in expanded["concept"]:
+            all_concepts.add(nid)
+        for nid in expanded["summary"]:
+            all_summaries.add(nid)
+
+        # 8) 组织成 AnswerGenerator 需要的 buckets
         ranked_nodes = {}
-        for node_id in context_nodes:
-            if self.global_graph.has_node(node_id):
-                node_data = self.global_graph.nodes[node_id]
-                node_type = node_data.get("node_type", "unknown")
-                
-                if node_type not in ranked_nodes:
-                    ranked_nodes[node_type] = []
-                
-                ranked_nodes[node_type].append({
-                    "id": node_id,
-                    "text": node_data.get("text", ""),
-                    "score": s_sem.get(node_id, 0.0)
-                })
-        
-        # 7. 答案生成
-        logger.info("\n步骤7: 答案生成")
+        ranked_nodes["chunk"] = self._make_bucket("chunk", all_chunks, s_sem)
+        ranked_nodes["proposition"] = self._make_bucket("proposition", all_props, s_sem)
+        ranked_nodes["concept"] = self._make_bucket("concept", all_concepts, s_sem)
+        ranked_nodes["summary"] = self._make_bucket("summary", all_summaries, s_sem)
+
+        logger.info("最终送入LLM的节点数: chunk=%d prop=%d concept=%d summary=%d",
+                    len(ranked_nodes["chunk"]), len(ranked_nodes["proposition"]),
+                    len(ranked_nodes["concept"]), len(ranked_nodes["summary"]))
+
+        # 9) 答案生成
         result = self.answer_generator.generate_answer(query, ranked_nodes, self.global_graph)
-        
-        # 添加元数据
+
         result["metadata"] = {
             "intent_type": intent_type,
             "num_candidate_chunks": len(chunk_ids),
             "num_subgraph_nodes": G_q.number_of_nodes(),
             "num_subgraph_edges": G_q.number_of_edges(),
-            "num_anchors": len(top_anchors),
-            "num_context_nodes": len(context_nodes)
+            "num_chunk_anchors": len(chunk_anchors),
         }
-        
-        logger.info(f"\n{'='*60}")
-        logger.info(f"RAG查询完成")
-        logger.info(f"{'='*60}\n")
-        
+
+        logger.info("查询结束")
         return result
-    
+
+    # -------------------------
+    # Subgraph (N-hop)
+    # -------------------------
     def _extract_subgraph(self, chunk_ids: List[str], hops: int = 2) -> nx.Graph:
-        """
-        从chunk集合在全局图中做N-hop扩展，得到查询子图
-        
-        2-hop原因：
-        - 第1跳：chunk -> proposition/concept/summary
-        - 第2跳：proposition/concept/summary -> 其他相似节点
-        
-        Args:
-            chunk_ids: chunk ID列表
-            hops: 扩展跳数
-            
-        Returns:
-            查询子图 G_q
-        """
-        logger.info(f"从 {len(chunk_ids)} 个chunks开始{hops}-hop扩展")
-        
-        subgraph_nodes = set()
-        
-        # 添加起始chunk节点
-        for chunk_id in chunk_ids:
-            if self.global_graph.has_node(chunk_id):
-                subgraph_nodes.add(chunk_id)
-        
-        # 多跳扩展
-        current_nodes = set(chunk_ids)
+        sub_nodes = set()
+
+        # 起点：粗检出来的 chunks
+        for cid inchunk_ids:
+            if self.global_graph.has_node(cid):
+                sub_nodes.add(cid)
+
+        current = set(sub_nodes)
+
         for hop in range(hops):
             next_nodes = set()
-            
-            for node_id in current_nodes:
-                if not self.global_graph.has_node(node_id):
+            for nid in current:
+                if not self.global_graph.has_node(nid):
                     continue
-                
-                # 获取邻居
-                neighbors = list(self.global_graph.neighbors(node_id))
-                next_nodes.update(neighbors)
-            
-            subgraph_nodes.update(next_nodes)
-            current_nodes = next_nodes
-            
-            logger.info(f"  第{hop+1}跳: 新增 {len(next_nodes)} 个节点")
-        
-        # 提取子图
-        G_q = self.global_graph.subgraph(subgraph_nodes).copy()
-        
-        return G_q
+                for nb in self.global_graph.neighbors(nid):
+                    next_nodes.add(nb)
+
+            for x in next_nodes:
+                sub_nodes.add(x)
+            current = next_nodes
+
+            logger.info("  hop=%d new_nodes=%d", hop + 1, len(next_nodes))
+
+        return self.global_graph.subgraph(sub_nodes).copy()
+
+    # -------------------------
+    # Expand from chunk anchors
+    # -------------------------
+    def _expand_from_chunk_anchors(self, chunk_anchors: List[str], s_sem: Dict[str, float]):
+        """
+        对每个 chunk anchor 扩展：
+        - 4 个 proposition（HAS_PROP）
+        - 2 个 concept（HAS_CONCEPT）
+        - 1 个 summary（SUMMARIZED_BY）
+        - 2 个 相似 chunk（SIMILAR_TO，跨 doc）
+        """
+        out = {"chunk": [], "proposition": [], "concept": [], "summary": []}
+
+        for cid in chunk_anchors:
+            if not self.global_graph.has_node(cid):
+                continue
+
+            props = self._pick_props_for_chunk(cid, s_sem, k=4)
+            concepts = self._pick_concepts_for_chunk(cid, k=2)
+            summaries = self._pick_summaries_for_chunk(cid, k=1)
+            sim_chunks = self._pick_similar_chunks_for_chunk(cid, k=2)
+
+            for x in props:
+                out["proposition"].append(x)
+            for x in concepts:
+                out["concept"].append(x)
+            for x in summaries:
+                out["summary"].append(x)
+            for x in sim_chunks:
+                out["chunk"].append(x)
+
+        return out
+
+    def _pick_props_for_chunk(self, chunk_id: str, s_sem: Dict[str, float], k: int):
+       """
+        遍历 chunk 的所有邻居节点 nb：
+        nb 必须是 node_type == "proposition"
+        chunk—nb 这条边必须是 edge_type == "HAS_PROP"
+        给 nb 一个候选评分：(s_sem[nb], len(text))
+        按（语义分，长度）降序排序
+        取前 k 个
+       """
+        cand = []
+        for nb in self.global_graph.neighbors(chunk_id):
+            if not self.global_graph.has_node(nb):
+                continue
+            nd = self.global_graph.nodes[nb]
+            if nd.get("node_type") != "proposition":
+                continue
+            # 只 HAS_PROP
+            ed = self.global_graph.get_edge_data(chunk_id, nb) or {}
+            et = ed.get("edge_type")
+            if et != "HAS_PROP":
+                continue
+
+            score = s_sem.get(nb, 0.0)
+            text = nd.get("text") or ""
+            text_len = len(text)
+
+            cand.append((nb, score, text_len))
+
+        # 先按语义分，再按文本长度
+        cand.sort(key=lambda x: (x[1], x[2]), reverse=True)
+
+        out = []
+        for nb, _, _ in cand[:k]:
+            out.append(nb)
+        return out
+
+    def _pick_concepts_for_chunk(self, chunk_id: str, k: int):
+        """
+        邻居 nb 必须是 concept
+        边必须是 HAS_CONCEPT
+        用边属性 weight 排序取前 k
+        """
+        cand = []
+
+        for nb in self.global_graph.neighbors(chunk_id):
+            nd = self.global_graph.nodes[nb]
+            if nd.get("node_type") != "concept":
+                continue
+
+            ed = self.global_graph.get_edge_data(chunk_id, nb) or {}
+            if ed.get("edge_type") != "HAS_CONCEPT":
+                continue
+
+            w = ed.get("weight", 0.0)
+            cand.append((nb, float(w)))
+
+        cand.sort(key=lambda x: x[1], reverse=True)
+
+        out = []
+        for nb, _ in cand[:k]:
+            out.append(nb)
+        return out
+
+    def _pick_summaries_for_chunk(self, chunk_id: str, k: int):
+        cand = []
+
+        for nb in self.global_graph.neighbors(chunk_id):
+            nd = self.global_graph.nodes[nb]
+            if nd.get("node_type") != "summary":
+                continue
+
+            ed = self.global_graph.get_edge_data(chunk_id, nb) or {}
+            if ed.get("edge_type") != "SUMMARIZED_BY":
+                continue
+
+            cand.append(nb)
+
+        # summary一般不多
+        return cand[:k]
+
+    def _pick_similar_chunks_for_chunk(self, chunk_id: str, k: int):
+        """
+        取 SIMILAR_TO 的 chunk，要求跨 doc，按 cosine/weight 降序取前 k
+        """
+        doc_i = self.global_graph.nodes[chunk_id].get("doc_id")
+
+        cand = []
+        for nb in self.global_graph.neighbors(chunk_id):
+            nd = self.global_graph.nodes[nb]
+            if nd.get("node_type") != "chunk":
+                continue
+
+            ed = self.global_graph.get_edge_data(chunk_id, nb) or {}
+            if ed.get("edge_type") != "SIMILAR_TO":
+                continue
+
+            # 跨 doc
+            doc_j = nd.get("doc_id")
+            if doc_i is not None and doc_j is not None:
+                if doc_i == doc_j:
+                    continue
+
+            cos = ed.get("cosine")
+            if cos is None:
+                cos = ed.get("weight", 0.0)
+
+            cand.append((nb, float(cos)))
+
+        cand.sort(key=lambda x: x[1], reverse=True)
+
+        out = []
+        for nb, _ in cand[:k]:
+            out.append(nb)
+        return out
+
+    # -------------------------
+    # Build bucket for AnswerGenerator
+    # -------------------------
+    def _make_bucket(self, node_type: str, node_ids, s_sem: Dict[str, float]):
+        """
+        返回列表 [{"id","text","score"}, ...]
+        score 用语义分
+        """
+        out = []
+        for nid in node_ids:
+            if not self.global_graph.has_node(nid):
+                continue
+
+            nd = self.global_graph.nodes[nid]
+            if nd.get("node_type") != node_type:
+                continue
+
+            out.append({
+                "id": nid,
+                "text": nd.get("text", ""),
+                "score": float(s_sem.get(nid, 0.0)),
+            })
+
+        # 让 AnswerGenerator 自己再 topK 截断，这里只做一个简单排序
+        out.sort(key=lambda x: x["score"], reverse=True)
+        return out

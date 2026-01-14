@@ -16,6 +16,14 @@ graph_construction:
   summary_similarity_threshold: 0.7
   ollama_base_url: "http://localhost:11434"
   llm_model: "qwen2.5:14b"
+  
+  # 简单召回与分组参数
+  recall_top_k: 25                    # embedding 近邻候选数
+  edge_cosine_threshold: 0.72         # 建边的余弦相似度门槛
+  entity_overlap_threshold: 1         # 实体交集个数门槛
+  cross_doc_only: true                # 强制跨文档建边
+  max_groups: 8                       # 最终最多 summary 组数
+  max_llm_group_input: 12             # 每次喂给 LLM 的 chunk 数上限
 
 subgraph:
   hops: 2
@@ -42,3 +50,8 @@ answer_generation:
   k_s: 2
   llm_model: "qwen2.5:14b"
   ollama_base_url: "http://localhost:11434"
+
+graph_construction:
+  max_tokens_per_chunk: 300
+  hf_tokenizer_name: "BAAI/bge-m3"
+  dedup_by_title: true

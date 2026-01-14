@@ -1,82 +1,142 @@
-"""
-结构中心度排序模块（朴素版，在子图G_q上算结构分）
-
-目标：
-- 在子图 G_q 上计算结构分（k-core + betweenness）
-- 只对 anchors 这批候选锚点做排序，返回 top-k0
-"""
-
 import logging
 import networkx as nx
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
 
 class StructuralCentralityRanker:
-    """结构中心度排序器"""
+    """
+    结构排序（设计 A）：
+    - 在全图上计算结构中心性（k-core + betweenness）
+    - 只对传入的 anchor 节点取分
+    - 按类型分别排序并截断：
+        chunk=6, proposition=6, concept=3, summary=3
+    """
 
-    def __init__(self, config):
-        cfg = config or {}
-        self.config = cfg
+    def __init__(self, cfg=None):
+        cfg = cfg or {}
+
         self.alpha_core = float(cfg.get("alpha_core", 0.5))
         self.alpha_betw = float(cfg.get("alpha_betw", 0.5))
-        self.k0 = int(cfg.get("k0", 10))
+        self.gamma_sem = float(cfg.get("gamma_sem", 0.0))
+
+        self.k_chunk = int(cfg.get("k_chunk", 6))
+        self.k_prop = int(cfg.get("k_prop", 6))
+        self.k_concept = int(cfg.get("k_concept", 3))
+        self.k_summary = int(cfg.get("k_summary", 3))
+
+        self.allowed_types = ["chunk", "proposition", "concept", "summary"]
 
         logger.info(
-            "StructuralCentralityRanker initialized: alpha_core=%.2f, alpha_betw=%.2f, k0=%d",
-            self.alpha_core,
-            self.alpha_betw,
-            self.k0,
+            "StructuralCentralityRanker init: "
+            "kC=%d kP=%d kZ=%d kS=%d",
+            self.k_chunk, self.k_prop, self.k_concept, self.k_summary
         )
 
-    def rank_anchor_nodes(self, graph, anchors, s_sem=None):
-        """对 anchors 在子图上做结构排序，返回 top-k0 的锚点id列表"""
-        logger.info("开始锚点结构排序：anchors=%d", len(anchors))
-        if not anchors:
-            return []
-
-        s_struc = self.compute_structural_importance(graph, anchors)
-        sorted_anchors = sorted(s_struc.items(), key=lambda x: x[1], reverse=True)
-        top_anchors = [nid for nid, _ in sorted_anchors[: self.k0]]
-
-        logger.info("锚点结构排序完成：返回 top-%d", len(top_anchors))
-        return top_anchors
-
-    def compute_structural_importance(self, graph, anchors):
+    def _compute_structural_scores(self, graph: nx.Graph):
         """
-        在子图上计算结构重要性分数
-        步骤：
-        1) 在 G_q 上转无向图
-        2) 在无向图上计算 core_number 与 betweenness
-        3) 归一化后加权得到每个节点的结构分
-        4) 只返回 anchors 的结构分
+        在整个图上计算每个节点的结构分
         """
-        logger.info("计算结构重要性：anchors=%d, subgraph_nodes=%d", len(anchors), graph.number_of_nodes())
+        scores = {}
 
         if graph.number_of_nodes() == 0:
-            return {a: 0.0 for a in anchors}
+            return scores
 
-        undirected = graph.to_undirected()
+        g = graph.to_undirected()
 
-        core_num = nx.core_number(undirected)
-        betw = nx.betweenness_centrality(undirected)
+        core_num = nx.core_number(g)
+        betw = nx.betweenness_centrality(g)
 
-        max_core = max(core_num.values()) if core_num else 1
-        max_betw = max(betw.values()) if betw else 1
-        if max_core <= 0:
+        # -------- core 归一化 --------
+        max_core = 0
+        for v in core_num.values():
+            if v > max_core:
+                max_core = v
+        if max_core == 0:
             max_core = 1
-        if max_betw <= 0:
-            max_betw = 1
 
-        s_all = {}
-        for n in undirected.nodes():
-            core_norm = core_num.get(n, 0) / max_core
-            betw_norm = betw.get(n, 0.0) / max_betw
-            s_all[n] = self.alpha_core * core_norm + self.alpha_betw * betw_norm
+        # -------- betweenness 归一化 --------
+        max_betw = 0.0
+        for v in betw.values():
+            if v > max_betw:
+                max_betw = v
+        if max_betw == 0.0:
+            max_betw = 1.0
 
-        s_anchor = {}
-        for a in anchors:
+        # -------- 合成结构分 --------
+        for node in g.nodes():
+            core_score = core_num.get(node, 0) / max_core
+            betw_score = betw.get(node, 0.0) / max_betw
+            scores[node] = (
+                self.alpha_core * core_score
+                + self.alpha_betw * betw_score
+            )
 
-            s_anchor[a] = float(s_all.get(a, 0.0))
+        return scores
 
-        return s_anchor
+    def rank_anchor_nodes(self, graph: nx.Graph, anchors, s_sem=None):
+        """
+        输入：
+            anchors: 语义锚点（来自子图）
+            s_sem: {node_id: semantic_score}
+        输出：
+            {
+              "chunk": [...],
+              "proposition": [...],
+              "concept": [...],
+              "summary": [...]
+            }
+        """
+        result = {
+            "chunk": [],
+            "proposition": [],
+            "concept": [],
+            "summary": [],
+        }
+
+        if not anchors:
+            return result
+
+        if s_sem is None:
+            s_sem = {}
+
+        struct_scores = self._compute_structural_scores(graph)
+
+        # 1) 给 anchor 打总分
+        buckets = defaultdict(list)
+
+        for node_id in anchors:
+            if node_id not in graph:
+                continue
+
+            node_type = graph.nodes[node_id].get("node_type")
+            if node_type not in self.allowed_types:
+                continue
+
+            score = struct_scores.get(node_id, 0.0)
+
+            if self.gamma_sem != 0.0:
+                score += self.gamma_sem * s_sem.get(node_id, 0.0)
+
+            buckets[node_type].append((node_id, score))
+
+        # 2) 每类排序
+        for node_type in buckets:
+            buckets[node_type].sort(key=lambda x: x[1], reverse=True)
+
+        # 3) 每类截断
+        result["chunk"] = [n for n, _ in buckets.get("chunk", [])[: self.k_chunk]]
+        result["proposition"] = [n for n, _ in buckets.get("proposition", [])[: self.k_prop]]
+        result["concept"] = [n for n, _ in buckets.get("concept", [])[: self.k_concept]]
+        result["summary"] = [n for n, _ in buckets.get("summary", [])[: self.k_summary]]
+
+        logger.info(
+            "Structural anchors selected: C=%d P=%d Z=%d S=%d",
+            len(result["chunk"]),
+            len(result["proposition"]),
+            len(result["concept"]),
+            len(result["summary"]),
+        )
+
+        return result
