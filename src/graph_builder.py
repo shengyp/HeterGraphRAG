@@ -21,38 +21,30 @@ from sklearn.cluster import KMeans
 
 logger = logging.getLogger(__name__)
 
-# -----------------------------
-# Optional ANN backend: hnswlib
-# -----------------------------
-try:
-    import hnswlib  # pip install hnswlib
-    _HNSW_AVAILABLE = True
-except Exception:
-    _HNSW_AVAILABLE = False
 
+def cosine_matrix_topk_simple(X, topk):
+    N = X.shape[0]
 
-def _cosine_matrix_topk_bruteforce(X: np.ndarray, topk: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Brute-force topk cosine neighbors for ALL points.
+    # 1. 归一化
+    X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
 
-    Returns:
-        idx: (N, topk) neighbor indices
-        sim: (N, topk) cosine similarities
-    Note: includes self unless filtered by caller.
-    """
-    norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
-    Xn = X / norms
-    S = Xn @ Xn.T  # (N, N)
+    # 2. 相似度矩阵
+    S = X @ X.T
 
-    k = min(topk, S.shape[1] - 1)
-    idx = np.argpartition(-S, kth=k, axis=1)[:, :topk]
+    all_idx = []
+    all_sim = []
 
-    row = np.arange(S.shape[0])[:, None]
-    sim = S[row, idx]
-    order = np.argsort(-sim, axis=1)
-    idx = idx[row, order]
-    sim = sim[row, order]
-    return idx, sim
+    # 3. 对每一行，直接排序取前 topk
+    for i in range(N):
+        sims = S[i]                 # 第 i 个向量和所有向量的相似度
+        order = np.argsort(-sims)   # 从大到小排序
+        top_idx = order[:topk]
+        top_sim = sims[top_idx]
 
+        all_idx.append(top_idx)
+        all_sim.append(top_sim)
+
+    return np.array(all_idx), np.array(all_sim)
 
 class GraphBuilder:
     def __init__(self, config: Dict):
@@ -60,6 +52,7 @@ class GraphBuilder:
         self.config = config
 
         required_keys = [
+            # ---- 相似度 / 聚类 / LLM ----
             "entity_similarity_threshold",
             "concept_num_clusters",
             "proposition_similarity_threshold",
@@ -67,41 +60,52 @@ class GraphBuilder:
             "summary_similarity_threshold",
             "ollama_base_url",
             "llm_model",
+
+            # ---- 召回 / 分组 / 图构建 ----
+            "recall_top_k",
+            "edge_cosine_threshold",
+            "entity_overlap_threshold",
+            "cross_doc_only",
+            "max_groups",
+            "max_llm_group_input",
+            "embedding_dim",
         ]
+
         missing = [k for k in required_keys if k not in config]
         if missing:
             raise ValueError(f"GraphBuilder 配置缺少必填项: {', '.join(missing)}")
 
-        self.entity_similarity_threshold = config["entity_similarity_threshold"]
-        self.concept_num_clusters = config["concept_num_clusters"]
-        self.proposition_similarity_threshold = config["proposition_similarity_threshold"]
-        self.concept_similarity_threshold = config["concept_similarity_threshold"]
-        self.summary_similarity_threshold = config["summary_similarity_threshold"]
+        # ---- 统一直接读取 ----
+        self.entity_similarity_threshold = float(config["entity_similarity_threshold"])
+        self.concept_num_clusters = int(config["concept_num_clusters"])
+        self.proposition_similarity_threshold = float(config["proposition_similarity_threshold"])
+        self.concept_similarity_threshold = float(config["concept_similarity_threshold"])
+        self.summary_similarity_threshold = float(config["summary_similarity_threshold"])
+
         self.ollama_base_url = str(config["ollama_base_url"]).rstrip("/")
-        self.llm_model = config["llm_model"]
+        self.llm_model = str(config["llm_model"])
 
-        # ---- 简单召回与分组参数（可调）----
-        self.recall_top_k = int(config.get("recall_top_k", 25))  # embedding 近邻候选
-        self.edge_cosine_threshold = float(config.get("edge_cosine_threshold", 0.72))  # 建边门槛
-        self.entity_overlap_threshold = int(config.get("entity_overlap_threshold", 1))  # 实体交集个数门槛
-        self.cross_doc_only = bool(config.get("cross_doc_only", True))  # 强制跨文档
-        self.max_groups = int(config.get("max_groups", 8))  # 最终最大 summary 组数
-        self.max_llm_group_input = int(config.get("max_llm_group_input", 12))  # 单次喂给 LLM 的 chunk 数量
-        self.embedding_dim = int(config.get("embedding_dim", 1024))  # bge-m3 常见为 1024
+        self.recall_top_k = int(config["recall_top_k"])
+        self.edge_cosine_threshold = float(config["edge_cosine_threshold"])
+        self.entity_overlap_threshold = int(config["entity_overlap_threshold"])
+        self.cross_doc_only = bool(config["cross_doc_only"])
+        self.max_groups = int(config["max_groups"])
+        self.max_llm_group_input = int(config["max_llm_group_input"])
+        self.embedding_dim = int(config["embedding_dim"])
 
-        logger.info("GraphBuilder init done (simple recall -> LLM grouping)")
+        logger.info("GraphBuilder 初始化完成")
 
     # -------------------------
     # 通用小工具
     # -------------------------
     def _norm_entity(self, s: str) -> str:
-        s = (s or "").strip().lower()
+        s = s.strip().lower()
         s = re.sub(r"\s+", " ", s)  # 多空格归一
         s = re.sub(r"\s*\(.*?\)\s*$", "", s)  # 去尾部括号解释
         return s
 
     def _safe_doc_id(self, chunk: Dict) -> str:
-        """获取 chunk 的文档ID（尽量稳定）"""
+        """获取 chunk 的文档ID"""
         for k in ("doc_id", "source_doc_id", "document_id", "title"):
             v = chunk.get(k)
             if v:
@@ -121,7 +125,7 @@ class GraphBuilder:
         try:
             resp = requests.post(url, json=payload, timeout=30)
             resp.raise_for_status()
-            emb = (resp.json() or {}).get("embedding")
+            emb = (resp.json()).get("embedding")
             if not emb:
                 raise ValueError("Empty embedding in response")
 
@@ -140,36 +144,59 @@ class GraphBuilder:
     def _extract_first_json_object(self, raw: str) -> str:
         """
         从文本中提取第一个完整 JSON object（用大括号计数），避免贪婪解析导致 Extra data
+        :param raw: 原始的LLM输出字符串
+        :return: 提取到的第一个完整JSON对象的字符串
+        :raise ValueError: 输入为空、无左大括号、大括号不平衡时抛出异常
         """
+        # 1. 空值校验：判断输入原始字符串是否为空（空字符串、None等）
         if not raw:
+            # 若为空，抛出明确异常，终止后续处理
             raise ValueError("Empty LLM output")
 
+        # 2. 预处理：清理LLM输出中多余的Markdown代码块格式，避免干扰JSON提取
+        # 2.1 去除字符串首尾的空白字符（空格、换行、制表符等）
         s = raw.strip()
+        # 2.2 移除开头的Markdown代码块标记（``` 或 ```json，忽略大小写，后续忽略空白）
         s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+        # 2.3 移除结尾的Markdown代码块标记（任意空白+```）
         s = re.sub(r"\s*```$", "", s)
 
+        # 3. 查找JSON对象的起始位置：定位第一个左大括号{（JSON对象的根起始标识）
         start = s.find("{")
+        # 若未找到左大括号，说明不是有效JSON格式开头，抛出异常
         if start < 0:
             raise ValueError("No '{' found in LLM output")
 
-        depth = 0
-        in_str = False
-        escape = False
+        # 4. 定义核心状态变量
+        depth = 0  
+        in_str = False 
+        escape = False  
 
+        # 5. 核心循环：从第一个{开始遍历，匹配对应的闭合}，提取完整JSON
         for i in range(start, len(s)):
+            # 获取当前遍历到的字符
             ch = s[i]
+
+            # 分支1：当前处于JSON字符串内部（in_str=True）
             if in_str:
+                # 5.1.1 若上一个字符是转义符\，则当前字符被转义，重置转义状态并跳过
                 if escape:
                     escape = False
+                # 5.1.2 若当前字符是\，标记为转义状态，下一个字符将被转义
                 elif ch == "\\":
                     escape = True
+                # 5.1.3 若当前字符是"，说明字符串结束，重置"处于字符串内部"状态
                 elif ch == '"':
                     in_str = False
+                # 5.1.4 字符串内部的其他字符（包括{}）均为普通内容，直接跳过，不参与深度计数
                 continue
+
             else:
+             
                 if ch == '"':
                     in_str = True
                     continue
+           
                 if ch == "{":
                     depth += 1
                 elif ch == "}":
@@ -177,42 +204,119 @@ class GraphBuilder:
                     if depth == 0:
                         return s[start : i + 1]
 
+        # 6. 循环结束未返回，说明遍历完所有字符仍未找到匹配的闭合}，大括号不平衡
         raise ValueError("No complete JSON object found (unbalanced braces)")
-
     # -------------------------
     # Step 1: 从 chunk 抽取 facts & entities
     # -------------------------
     def extract_facts_and_entities_from_chunk(self, chunk: Dict) -> Tuple[List[Dict], List[str]]:
         """使用 LLM 从 chunk 文本中抽取 facts 和实体"""
-        text = chunk.get("text", "") or ""
+        text = chunk.get("text")
         facts: List[Dict] = []
         entities: List[str] = []
 
         prompt = f"""# Role
-You are a knowledge extraction expert specializing in identifying factual statements, entities, and semantic relationships from text.
+You are an information extraction system designed to decompose long text chunks
+into atomic factual statements and their associated entities, for downstream
+knowledge graph construction.
 
-# Task
-Extract all facts and entities from the given paragraph. For each fact, generate semantic triplets (head entity, predicate, tail entity).
+# Objective
+Given an input text chunk (which may contain multiple sentences and topics),
+extract:
+(1) a normalized list of entities appearing in the chunk
+(2) a list of atomic, standalone factual statements
+(3) semantic triplets representing each fact
 
-# Instructions
-- First identify all important entities (people, places, organizations, concepts, etc.)
-- Use the most informative name for each entity (avoid pronouns like "he", "it")
-- Each fact should be a complete, standalone statement
-- Each triplet format: [head_entity, predicate, tail_entity]
-- Output ONLY valid JSON in the specified format
+The output MUST be deterministic, schema-consistent, and suitable for automated parsing
+in a knowledge graph pipeline.
+
+# Definitions
+- Entity:
+A concrete, identifiable object or concept, including:
+people, organizations, locations, events, works, scientific theories, and named concepts.
+Do NOT include pronouns.
+Do NOT include pure numbers or dates as entities.
+
+- Time Expression:
+A year, date, or temporal phrase (e.g., "1905", "in the 20th century").
+Time expressions are NOT entities and must be stored as literals.
+
+- Fact:
+A single, atomic, standalone factual statement extracted from the text chunk.
+A fact must not be further decomposable without losing semantic meaning.
+A long text chunk may contain multiple facts.
+
+- Triplet:
+A semantic relation in the form:
+[head_entity, predicate, tail]
+
+Rules:
+- head_entity MUST be an entity
+- tail MUST be either an entity or a literal (string or time)
+- predicates MUST be concise verb phrases (lowercase, no tense variation)
+
+# Extraction Rules
+1. Decompose the text chunk into minimal atomic facts.
+2. Identify all entities mentioned across the entire chunk.
+3. Normalize entity names using their most informative canonical form.
+4. For each fact, generate one or more semantic triplets.
+5. If a fact involves time, represent time as a literal string in the triplet.
+6. Do NOT invent facts not explicitly stated in the text chunk.
+7. Do NOT include explanatory text, comments, or formatting outside JSON.
+
+# Output Schema (STRICT)
+Return ONLY valid JSON with the following structure:
+
+{{
+  "entities": [
+    "Entity A",
+    "Entity B"
+  ],
+  "facts": [
+    {{
+      "fact": "Complete standalone factual statement.",
+      "triplets": [
+        ["Entity A", "predicate", "Entity B or literal"]
+      ]
+    }}
+  ]
+}}
 
 # Example
-Input:
-Paragraph: "Albert Einstein developed the theory of relativity in 1905. The theory revolutionized physics."
+Input Chunk:
+"Albert Einstein developed the theory of relativity in 1905. The theory revolutionized physics."
 
 Output:
-{{"entities": ["Albert Einstein", "theory of relativity", "physics", "1905"], "facts": {{"f1": {{"fact": "Albert Einstein developed the theory of relativity in 1905.", "triplets": [["Albert Einstein", "developed", "theory of relativity"], ["theory of relativity", "developed in", "1905"]]}}, "f2": {{"fact": "The theory of relativity revolutionized physics.", "triplets": [["theory of relativity", "revolutionized", "physics"]]}}}}}}
+{{
+  "entities": [
+    "Albert Einstein",
+    "theory of relativity",
+    "physics"
+  ],
+  "facts": [
+    {{
+      "fact": "Albert Einstein developed the theory of relativity in 1905.",
+      "triplets": [
+        ["Albert Einstein", "developed", "theory of relativity"],
+        ["theory of relativity", "developed_in", "1905"]
+      ]
+    }},
+    {{
+      "fact": "The theory of relativity revolutionized physics.",
+      "triplets": [
+        ["theory of relativity", "revolutionized", "physics"]
+      ]
+    }}
+  ]
+}}
 
-# Your Task
-Paragraph:
+# Task
+Text Chunk:
 {text}
 
-Output (JSON only):"""
+# Output Requirement
+Output ONLY valid JSON. Do not include markdown, comments, or extra text.
+"""
 
         try:
             response = requests.post(
@@ -225,28 +329,31 @@ Output (JSON only):"""
                 },
                 timeout=60,
             )
+            #加载状态
             response.raise_for_status()
 
-            result = (response.json() or {}).get("response", "").strip()
+            result = response.json()["response"].strip()
             json_str = self._extract_first_json_object(result)
             data = json.loads(json_str)
 
-            entities = data.get("entities", []) or []
+            entities = data.get("entities") or []
+            facts_list = data.get("facts") or []
 
-            facts_data = data.get("facts", {}) or {}
             facts = []
-            for _, fact_info in facts_data.items():
+
+            for fact_info in facts_list:
                 if not (isinstance(fact_info, dict) and "fact" in fact_info):
                     continue
 
                 fact_text = fact_info["fact"]
-                triplets = fact_info.get("triplets", []) or []
+                triplets = fact_info.get("triplets")
 
                 # fact_entities: 先用“实体列表在 fact 文本中出现”作为粗命中
                 fact_entities = []
-                ft_low = (fact_text or "").lower()
+                #转小写
+                ft_low = (fact_text).lower()
                 for entity in entities:
-                    if (entity or "").lower() in ft_low:
+                    if entity.lower() in ft_low:
                         fact_entities.append(entity)
 
                 # 再从 triplets 中补充（只收集在 entities 列表中出现的）
@@ -480,79 +587,78 @@ Concept (1-3 words only):"""
         except Exception as e:
             logger.warning(f"LLM概念生成失败: {e}")
 
-        # 降级：使用实体列表前三个做提示
+     
         return f"Concept: {', '.join(cluster_entities[:3])}"
 
     def _generate_concept_text_from_entities(self, cluster_entities: List[str]) -> str:
-    """
-    使用 LLM 从实体列表生成概念文本（1-3词）
+        """
+        使用 LLM 从实体列表生成概念文本（1-3词）
 
-    输入：一个概念簇内的实体列表，例如：
-        ["Albert Einstein", "theory of relativity", "physics", "Nobel Prize"]
-    输出：一个短概念名，例如：
-        "Theoretical Physics"
+        输入：一个概念簇内的实体列表，例如：
+            ["Albert Einstein", "theory of relativity", "physics", "Nobel Prize"]
+        输出：一个短概念名，例如：
+            "Theoretical Physics"
 
-    目的：把 entity cluster 压缩成可读的 concept label（Z 节点 text）
-    """
-    if not cluster_entities:
-        return "Concept"
+        目的：把 entity cluster 压缩成可读的 concept label（Z 节点 text）
+        """
+        if not cluster_entities:
+            return "Concept"
 
-    # 只取前 10 个实体，控制 prompt 长度，避免 LLM 输入爆炸
-    entities_str = ", ".join(cluster_entities[:10])
+        # 只取前 100 个实体，控制 prompt 长度，避免 LLM 输入爆炸
+        entities_str = ", ".join(cluster_entities[:100])
 
-    prompt = f"""# Role
-You are a concept extraction expert who identifies the core concept from a list of entities.
+        prompt = f"""# Role
+    You are a concept extraction expert who identifies the core concept from a list of entities.
 
-# Task
-Extract a SHORT concept name (1-3 words) that represents the main theme connecting these entities.
+    # Task
+    Extract a SHORT concept name (1-3 words) that represents the main theme connecting these entities.
 
-# Instructions
-- Output ONLY 1-3 words
-- Use a noun or noun phrase
-- Capture the core concept that connects the entities
-- Do NOT write full sentences
+    # Instructions
+    - Output ONLY 1-3 words
+    - Use a noun or noun phrase
+    - Capture the core concept that connects the entities
+    - Do NOT write full sentences
 
-# Examples
-Entities: Albert Einstein, theory of relativity, physics, Nobel Prize
-Output: "Theoretical Physics"
+    # Examples
+    Entities: Albert Einstein, theory of relativity, physics, Nobel Prize
+    Output: "Theoretical Physics"
 
-Entities: Paris, France, capital, Eiffel Tower
-Output: "French Capital"
+    Entities: Paris, France, capital, Eiffel Tower
+    Output: "French Capital"
 
-Entities: 1905, publication, special relativity
-Output: "Relativity Publication"
+    Entities: 1905, publication, special relativity
+    Output: "Relativity Publication"
 
-# Your Task
-Entities: {entities_str}
+    # Your Task
+    Entities: {entities_str}
 
-Concept (1-3 words only):"""
+    Concept (1-3 words only):"""
 
-    try:
-        # 调用 Ollama generate：让 LLM 输出概念名
-        response = requests.post(
-            f"{self.ollama_base_url}/api/generate",
-            json={
-                "model": self.llm_model,
-                "prompt": prompt,
-                "stream": False,
-                # num_predict=10 基本够 1-3 个词；temperature=0.3 保持一定多样性但不太发散
-                "options": {"num_predict": 10, "temperature": 0.3},
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        concept_text = (response.json() or {}).get("response", "").strip()
+        try:
+            # 调用 Ollama generate：让 LLM 输出概念名
+            response = requests.post(
+                f"{self.ollama_base_url}/api/generate",
+                json={
+                    "model": self.llm_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    # num_predict=10 基本够 1-3 个词；temperature=0.3 保持一定多样性但不太发散
+                    "options": {"num_predict": 10, "temperature": 0.3},
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            concept_text = (response.json() or {}).get("response", "").strip()
 
-        # 若 LLM 返回非空，直接使用
-        # （建议：你可以额外做一次“词数裁剪/清洗”，防止模型输出带引号或多余句子）
-        if concept_text:
-            return concept_text
-    except Exception as e:
-        logger.warning(f"LLM概念生成失败: {e}")
+            # 若 LLM 返回非空，直接使用
+            if concept_text:
+                return concept_text
+        except Exception as e:
+            logger.warning(f"LLM概念生成失败: {e}")
 
-    # 降级策略：不用 LLM 时，用前三个实体拼一个占位概念
-    # 注意：这种降级输出并不满足“1-3词”的严格要求，但至少可追踪簇内容
-    return f"Concept: {', '.join(cluster_entities[:3])}"
+        # 降级策略：不用 LLM 时，用前三个实体拼一个占位概念
+       
+        return f"Concept: {', '.join(cluster_entities[:3])}"
 
 
     # -------------------------
@@ -563,12 +669,12 @@ Concept (1-3 words only):"""
         调用 LLM 为一组 chunks 生成 2-3 句摘要，强调逻辑连接
 
         设计：
-        - 只选前 6 个 chunk（控制 prompt 长度）
+        - 只选前 5 个 chunk（控制 prompt 长度）
         - 每个 chunk 最多截取 800 字符
         - 强制 summary 输出包含逻辑连接词（because/therefore/...）
         - 禁止编造 chunk 里没有的事实
         """
-        selected = chunks[:6]
+        selected = chunks[:5]
         block = []
         for i, c in enumerate(selected, start=1):
             # 给每段 chunk 加上编号与 id，便于 LLM 引用和对齐
@@ -600,13 +706,13 @@ Concept (1-3 words only):"""
                     "model": self.llm_model,
                     "prompt": prompt,
                     "stream": False,
-                    # temperature=0.2 更稳；num_predict=240 足够 2-3 句
+                   
                     "options": {"temperature": 0.2, "num_predict": 240},
                 },
                 timeout=50,
             )
             resp.raise_for_status()
-            out = (resp.json() or {}).get("response", "").strip()
+            out = resp.json()["response"].strip()
 
             # 若 LLM 输出为空，降级返回截断后的输入（至少不至于空 summary）
             return out if out else combined[:250]
@@ -630,20 +736,30 @@ Concept (1-3 words only):"""
         u = embs / norms
 
         # 相似度矩阵 sim = U * U^T，形状 (N, N)
+        #第 i 行：向量 i 和所有向量的相似度
+        #第 j 列：所有向量和向量 j 的相似度
         sim = u @ u.T
 
         # 排除自身：把对角线设为 -1，避免 topk 选到自己
         np.fill_diagonal(sim, -1.0)
 
         out = []
-        # top_k 不能超过 N-1
+        # top_k 不能超过行数 N-1
         top_k = min(top_k, sim.shape[0] - 1)
 
         for i in range(sim.shape[0]):
-            # argpartition：O(N) 取前 top_k 大的索引（无序）
+            # argpartition：O(N) 取前 top_k 大的索引列表
             idx = np.argpartition(sim[i], -top_k)[-top_k:]
             # 再按相似度降序排列
             idx = idx[np.argsort(sim[i][idx])[::-1]]
+
+            #最后输出的是 类似于
+            #out = [
+                    #[(2, 0.707), (1, 0.0)],  # 对 0
+                    #[(2, 0.707), (0, 0.0)],  # 对 1
+                    #[(0, 0.707), (1, 0.707)] # 对 2
+                    #]
+         
             out.append([(int(j), float(sim[i, j])) for j in idx])
         return out
 
@@ -682,7 +798,7 @@ Concept (1-3 words only):"""
         embs = []
         for c in chunks:
             if "embedding" not in c or c["embedding"] is None:
-                # 缺 embedding 就即时编码：注意这会触发 embeddings API 调用
+                # 缺 embedding 就直接再编码
                 c["embedding"] = self._encode_text(c.get("text", ""))
             embs.append(np.asarray(c["embedding"], dtype=float))
         embs = np.vstack(embs)  # (N, D)
@@ -710,7 +826,7 @@ Concept (1-3 words only):"""
                 nid = id_at[j]
                 doc_j = UG.nodes[nid]["doc_id"]
 
-                # 可选：只允许跨文档边
+                # 只允许跨文档边
                 if self.cross_doc_only and doc_i == doc_j:
                     continue
 
@@ -890,8 +1006,8 @@ Concept (1-3 words only):"""
         if not initial_groups:
             return []
 
-        # 只取前若干个初始簇，避免 LLM 调用爆炸
-        initial_groups = initial_groups[: max(1, self.max_groups * 2)]
+        # 这里我是固定阈值的，后面感觉需要修改为动态
+        initial_groups = initial_groups[: max(1, self.max_groups * 10)]
 
         # 方便通过 id 快速取 chunk
         id_to_chunk = {c["id"]: c for c in chunks if c.get("id")}
@@ -904,7 +1020,7 @@ Concept (1-3 words only):"""
                 continue
 
             # 如果簇太大，按 max_llm_group_input 切块，分批喂给 LLM
-            # 注意：切块会破坏全局最优分组（因为跨子块的逻辑关系无法被 LLM 看到）
+            # 但是这里：切块会破坏全局最优分组（因为跨子块的逻辑关系无法被 LLM 看到）
             if len(comp) > self.max_llm_group_input:
                 for i in range(0, len(comp), self.max_llm_group_input):
                     sub = comp[i : i + self.max_llm_group_input]
@@ -1010,7 +1126,7 @@ Concept (1-3 words only):"""
 
             graph.add_node(chunk["id"], node_type="chunk", **chunk)
 
-        # 2) 构建 proposition 节点（优先预构建）
+        # 2) 构建 proposition 节点
         all_propositions: List[Dict] = []
         seen_prop_ids = set()
         for chunk in chunks_coref:
