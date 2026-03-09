@@ -1,1210 +1,686 @@
-"""
-新图构建模块
 
-构建包含 C / P / Z / S 四类节点的异构图（不包含关系节点 R）
-- C: chunk
-- P: proposition
-- Z: concept
-- S: summary
-"""
 
+import json
 import logging
 import re
-import json
-from typing import Dict, List, Tuple, Optional
-from collections import defaultdict
+import hashlib
+from typing import Dict, List, Tuple, Set
 
-import numpy as np
 import networkx as nx
+import numpy as np
 import requests
-from sklearn.cluster import KMeans
 
 logger = logging.getLogger(__name__)
 
 
-def cosine_matrix_topk_simple(X, topk):
-    N = X.shape[0]
-
-    # 1. 归一化
-    X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
-
-    # 2. 相似度矩阵
-    S = X @ X.T
-
-    all_idx = []
-    all_sim = []
-
-    # 3. 对每一行，直接排序取前 topk
-    for i in range(N):
-        sims = S[i]                 # 第 i 个向量和所有向量的相似度
-        order = np.argsort(-sims)   # 从大到小排序
-        top_idx = order[:topk]
-        top_sim = sims[top_idx]
-
-        all_idx.append(top_idx)
-        all_sim.append(top_sim)
-
-    return np.array(all_idx), np.array(all_sim)
-
 class GraphBuilder:
+
+    # 0) 初始化与配置
     def __init__(self, config: Dict):
-        """初始化图构建器"""
-        self.config = config
 
-        required_keys = [
-            # ---- 相似度 / 聚类 / LLM ----
-            "entity_similarity_threshold",
-            "concept_num_clusters",
-            "proposition_similarity_threshold",
-            "concept_similarity_threshold",
-            "summary_similarity_threshold",
-            "ollama_base_url",
-            "llm_model",
-
-            # ---- 召回 / 分组 / 图构建 ----
-            "recall_top_k",
-            "edge_cosine_threshold",
-            "entity_overlap_threshold",
-            "cross_doc_only",
-            "max_groups",
-            "max_llm_group_input",
-            "embedding_dim",
-        ]
-
-        missing = [k for k in required_keys if k not in config]
+        required = ["ollama_base_url", "llm_model", "embedding_dim", "entity_type_labels", "entity_type_cache_path"]
+        missing = [k for k in required if k not in config]
         if missing:
             raise ValueError(f"GraphBuilder 配置缺少必填项: {', '.join(missing)}")
 
-        # ---- 统一直接读取 ----
-        self.entity_similarity_threshold = float(config["entity_similarity_threshold"])
-        self.concept_num_clusters = int(config["concept_num_clusters"])
-        self.proposition_similarity_threshold = float(config["proposition_similarity_threshold"])
-        self.concept_similarity_threshold = float(config["concept_similarity_threshold"])
-        self.summary_similarity_threshold = float(config["summary_similarity_threshold"])
-
         self.ollama_base_url = str(config["ollama_base_url"]).rstrip("/")
         self.llm_model = str(config["llm_model"])
-
-        self.recall_top_k = int(config["recall_top_k"])
-        self.edge_cosine_threshold = float(config["edge_cosine_threshold"])
-        self.entity_overlap_threshold = int(config["entity_overlap_threshold"])
-        self.cross_doc_only = bool(config["cross_doc_only"])
-        self.max_groups = int(config["max_groups"])
-        self.max_llm_group_input = int(config["max_llm_group_input"])
         self.embedding_dim = int(config["embedding_dim"])
 
-        logger.info("GraphBuilder 初始化完成")
 
-    # -------------------------
-    # 通用小工具
-    # -------------------------
+        self.embedding_model = str(config.get("embedding_model", "bge-m3:latest"))
+        self.flush_type_cache_each_write = bool(config.get("flush_type_cache_each_write", False))
+
+
+        labels = config["entity_type_labels"]
+        if not isinstance(labels, list) or not labels:
+            raise ValueError("entity_type_labels 必须是非空 list")
+        self.type_labels: List[str] = sorted({str(x).strip().upper() for x in labels if str(x).strip()})
+        if not self.type_labels:
+            raise ValueError("entity_type_labels 清洗后为空")
+        self.type_label_set: Set[str] = set(self.type_labels)
+
+
+        self.type_cache_path = str(config["entity_type_cache_path"])
+        self.type_cache: Dict[str, str] = self._load_type_cache()
+
+        logger.info(
+            "GraphBuilder(strict) 初始化完成 | embedding_model=%s dim=%d | labels=%d | cache=%s",
+            self.embedding_model,
+            self.embedding_dim,
+            len(self.type_labels),
+            self.type_cache_path,
+        )
+
+
+    # 1) 通用工具
     def _norm_entity(self, s: str) -> str:
         s = s.strip().lower()
-        s = re.sub(r"\s+", " ", s)  # 多空格归一
-        s = re.sub(r"\s*\(.*?\)\s*$", "", s)  # 去尾部括号解释
+        s = re.sub(r"\s+", " ", s)
         return s
 
-    def _safe_doc_id(self, chunk: Dict) -> str:
-        """获取 chunk 的文档ID"""
-        for k in ("doc_id", "source_doc_id", "document_id", "title"):
-            v = chunk.get(k)
-            if v:
-                return str(v)
-        cid = str(chunk.get("id", "unknown"))
-        return cid.split("::")[0] if "::" in cid else "unknown_doc"
+    def _entity_node_id(self, entity_text: str) -> str:
+        """实体节点ID（保证同名实体合并）"""
+        return f"ent::{self._norm_entity(entity_text)}"
+
+    def _type_node_id(self, type_label: str) -> str:
+        """类型节点ID"""
+        return f"type::{type_label.strip().upper()}"
+
+
+    def _stable_prop_id(self, prop_text: str) -> str:
+
+        h = hashlib.sha1(prop_text.encode("utf-8")).hexdigest()[:10]
+        return f"prop::{h}"
 
     def _encode_text(self, text: str) -> List[float]:
-        """调用 Ollama embeddings 接口，将文本编码为向量"""
-        text = (text or "").strip()
+
+        text = text.strip()
         if not text:
-            return np.zeros(self.embedding_dim, dtype=float).tolist()
+            raise ValueError("embedding 输入文本为空（严格模式不允许）")
 
         url = f"{self.ollama_base_url}/api/embeddings"
-        payload = {"model": "bge-m3:latest", "prompt": text}
+        resp = requests.post(url, json={"model": self.embedding_model, "prompt": text}, timeout=60)
+        #检查http状态
+        resp.raise_for_status()
 
-        try:
-            resp = requests.post(url, json=payload, timeout=30)
-            resp.raise_for_status()
-            emb = (resp.json()).get("embedding")
-            if not emb:
-                raise ValueError("Empty embedding in response")
+        emb = (resp.json()).get("embedding", None)
+        if emb is None:
+            raise ValueError("embeddings 接口未返回 embedding 字段")
 
-            emb = np.asarray(emb, dtype=float).flatten()
-            if emb.shape[0] != self.embedding_dim:
-                if emb.shape[0] > self.embedding_dim:
-                    emb = emb[: self.embedding_dim]
-                else:
-                    emb = np.pad(emb, (0, self.embedding_dim - emb.shape[0]))
-            return emb.tolist()
-
-        except Exception as e:
-            logger.warning(f"编码失败: {e}")
-            return np.zeros(self.embedding_dim, dtype=float).tolist()
+        #把embedding压成一维
+        vec = np.asarray(emb, dtype=float).flatten()
+        if vec.shape[0] != self.embedding_dim:
+            raise ValueError(f"embedding 维度错误: got={vec.shape[0]} expected={self.embedding_dim}")
+        return vec.tolist()
 
     def _extract_first_json_object(self, raw: str) -> str:
-        """
-        从文本中提取第一个完整 JSON object（用大括号计数），避免贪婪解析导致 Extra data
-        :param raw: 原始的LLM输出字符串
-        :return: 提取到的第一个完整JSON对象的字符串
-        :raise ValueError: 输入为空、无左大括号、大括号不平衡时抛出异常
-        """
-        # 1. 空值校验：判断输入原始字符串是否为空（空字符串、None等）
-        if not raw:
-            # 若为空，抛出明确异常，终止后续处理
-            raise ValueError("Empty LLM output")
 
-        # 2. 预处理：清理LLM输出中多余的Markdown代码块格式，避免干扰JSON提取
-        # 2.1 去除字符串首尾的空白字符（空格、换行、制表符等）
+        if not raw:
+            raise ValueError("LLM 输出为空")
+
         s = raw.strip()
-        # 2.2 移除开头的Markdown代码块标记（``` 或 ```json，忽略大小写，后续忽略空白）
         s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
-        # 2.3 移除结尾的Markdown代码块标记（任意空白+```）
         s = re.sub(r"\s*```$", "", s)
 
-        # 3. 查找JSON对象的起始位置：定位第一个左大括号{（JSON对象的根起始标识）
         start = s.find("{")
-        # 若未找到左大括号，说明不是有效JSON格式开头，抛出异常
         if start < 0:
-            raise ValueError("No '{' found in LLM output")
+            raise ValueError("LLM 输出中找不到 '{'")
 
-        # 4. 定义核心状态变量
-        depth = 0  
-        in_str = False 
-        escape = False  
+        depth = 0
+        in_str = False
+        esc = False
 
-        # 5. 核心循环：从第一个{开始遍历，匹配对应的闭合}，提取完整JSON
         for i in range(start, len(s)):
-            # 获取当前遍历到的字符
             ch = s[i]
-
-            # 分支1：当前处于JSON字符串内部（in_str=True）
             if in_str:
-                # 5.1.1 若上一个字符是转义符\，则当前字符被转义，重置转义状态并跳过
-                if escape:
-                    escape = False
-                # 5.1.2 若当前字符是\，标记为转义状态，下一个字符将被转义
+                if esc:
+                    esc = False
                 elif ch == "\\":
-                    escape = True
-                # 5.1.3 若当前字符是"，说明字符串结束，重置"处于字符串内部"状态
+                    esc = True
                 elif ch == '"':
                     in_str = False
-                # 5.1.4 字符串内部的其他字符（包括{}）均为普通内容，直接跳过，不参与深度计数
                 continue
 
-            else:
-             
-                if ch == '"':
-                    in_str = True
-                    continue
-           
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        return s[start : i + 1]
+            if ch == '"':
+                in_str = True
+                continue
 
-        # 6. 循环结束未返回，说明遍历完所有字符仍未找到匹配的闭合}，大括号不平衡
-        raise ValueError("No complete JSON object found (unbalanced braces)")
-    # -------------------------
-    # Step 1: 从 chunk 抽取 facts & entities
-    # -------------------------
-    def extract_facts_and_entities_from_chunk(self, chunk: Dict) -> Tuple[List[Dict], List[str]]:
-        """使用 LLM 从 chunk 文本中抽取 facts 和实体"""
-        text = chunk.get("text")
-        facts: List[Dict] = []
-        entities: List[str] = []
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start : i + 1]
 
-        prompt = f"""# Role
-You are an information extraction system designed to decompose long text chunks
-into atomic factual statements and their associated entities, for downstream
-knowledge graph construction.
+        raise ValueError("JSON 大括号不平衡，无法抽取完整对象")
 
-# Objective
-Given an input text chunk (which may contain multiple sentences and topics),
-extract:
-(1) a normalized list of entities appearing in the chunk
-(2) a list of atomic, standalone factual statements
-(3) semantic triplets representing each fact
-
-The output MUST be deterministic, schema-consistent, and suitable for automated parsing
-in a knowledge graph pipeline.
-
-# Definitions
-- Entity:
-A concrete, identifiable object or concept, including:
-people, organizations, locations, events, works, scientific theories, and named concepts.
-Do NOT include pronouns.
-Do NOT include pure numbers or dates as entities.
-
-- Time Expression:
-A year, date, or temporal phrase (e.g., "1905", "in the 20th century").
-Time expressions are NOT entities and must be stored as literals.
-
-- Fact:
-A single, atomic, standalone factual statement extracted from the text chunk.
-A fact must not be further decomposable without losing semantic meaning.
-A long text chunk may contain multiple facts.
-
-- Triplet:
-A semantic relation in the form:
-[head_entity, predicate, tail]
-
-Rules:
-- head_entity MUST be an entity
-- tail MUST be either an entity or a literal (string or time)
-- predicates MUST be concise verb phrases (lowercase, no tense variation)
-
-# Extraction Rules
-1. Decompose the text chunk into minimal atomic facts.
-2. Identify all entities mentioned across the entire chunk.
-3. Normalize entity names using their most informative canonical form.
-4. For each fact, generate one or more semantic triplets.
-5. If a fact involves time, represent time as a literal string in the triplet.
-6. Do NOT invent facts not explicitly stated in the text chunk.
-7. Do NOT include explanatory text, comments, or formatting outside JSON.
-
-# Output Schema (STRICT)
-Return ONLY valid JSON with the following structure:
-
-{{
-  "entities": [
-    "Entity A",
-    "Entity B"
-  ],
-  "facts": [
-    {{
-      "fact": "Complete standalone factual statement.",
-      "triplets": [
-        ["Entity A", "predicate", "Entity B or literal"]
-      ]
-    }}
-  ]
-}}
-
-# Example
-Input Chunk:
-"Albert Einstein developed the theory of relativity in 1905. The theory revolutionized physics."
-
-Output:
-{{
-  "entities": [
-    "Albert Einstein",
-    "theory of relativity",
-    "physics"
-  ],
-  "facts": [
-    {{
-      "fact": "Albert Einstein developed the theory of relativity in 1905.",
-      "triplets": [
-        ["Albert Einstein", "developed", "theory of relativity"],
-        ["theory of relativity", "developed_in", "1905"]
-      ]
-    }},
-    {{
-      "fact": "The theory of relativity revolutionized physics.",
-      "triplets": [
-        ["theory of relativity", "revolutionized", "physics"]
-      ]
-    }}
-  ]
-}}
-
-# Task
-Text Chunk:
-{text}
-
-# Output Requirement
-Output ONLY valid JSON. Do not include markdown, comments, or extra text.
-"""
-
+    # =========================
+    # 2) 类型缓存（确定性工具，不是兜底）
+    # =========================
+    def _load_type_cache(self) -> Dict[str, str]:
         try:
-            response = requests.post(
-                f"{self.ollama_base_url}/api/generate",
-                json={
-                    "model": self.llm_model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.3},
-                },
-                timeout=60,
-            )
-            #加载状态
-            response.raise_for_status()
+            with open(self.type_cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("type_cache 文件必须是 JSON object")
 
-            result = response.json()["response"].strip()
-            json_str = self._extract_first_json_object(result)
-            data = json.loads(json_str)
-
-            entities = data.get("entities") or []
-            facts_list = data.get("facts") or []
-
-            facts = []
-
-            for fact_info in facts_list:
-                if not (isinstance(fact_info, dict) and "fact" in fact_info):
-                    continue
-
-                fact_text = fact_info["fact"]
-                triplets = fact_info.get("triplets")
-
-                # fact_entities: 先用“实体列表在 fact 文本中出现”作为粗命中
-                fact_entities = []
-                #转小写
-                ft_low = (fact_text).lower()
-                for entity in entities:
-                    if entity.lower() in ft_low:
-                        fact_entities.append(entity)
-
-                # 再从 triplets 中补充（只收集在 entities 列表中出现的）
-                for triplet in triplets:
-                    if not (isinstance(triplet, list) and len(triplet) >= 3):
-                        continue
-                    head, _, tail = triplet[0], triplet[1], triplet[2]
-                    if head in entities and head not in fact_entities:
-                        fact_entities.append(head)
-                    if tail in entities and tail not in fact_entities:
-                        fact_entities.append(tail)
-
-                facts.append(
-                    {
-                        "id": f"{chunk.get('id')}_fact_{len(facts)}",
-                        "text": fact_text,
-                        "entity_ids": fact_entities,
-                        "triplets": triplets,
-                        "source_chunk_id": chunk.get("id"),
-                    }
-                )
-
-            if facts and entities:
-                logger.info(f"LLM成功提取 {len(facts)} 个facts, {len(entities)} 个实体")
-                return facts, entities
-
-            logger.warning("LLM返回了空的facts或entities列表")
-
+            out: Dict[str, str] = {}
+            for k, v in data.items():
+                kk = str(k).strip()
+                vv = str(v).strip().upper()
+                if kk and vv:
+                    out[kk] = vv
+            return out
+        except FileNotFoundError:
+            return {}
         except Exception as e:
-            logger.warning(f"extract_facts_and_entities_from_chunk failed: {e}")
+            raise ValueError(f"加载 type_cache 失败: {e}")
+
+    def _save_type_cache(self) -> None:
+        with open(self.type_cache_path, "w", encoding="utf-8") as f:
+            json.dump(self.type_cache, f, ensure_ascii=False, indent=2)
+
+    # =========================
+    # 3) Step 1: chunk -> facts & entities（英文提示词：Role/Task/Example）
+    # =========================
+    def extract_facts_and_entities_from_chunk(self, chunk: Dict) -> Tuple[List[Dict], List[str]]:
+        """
+        从 chunk 文本抽取：
+        - entities: 规范化实体列表（字符串）
+        - facts: 原子事实列表，每条带 triplets、entity_ids、source_chunk_id
+        """
+        cid = chunk.get("id")
+        text = chunk.get("text")
+        if not (isinstance(text, str) and text.strip()):
+            raise ValueError(f"chunk 文本为空: chunk_id={cid}")
+
+        prompt = f"""# Role:
+        You are a structured information extractor for HotpotQA multi-hop question answering.
+        Your task is to convert a given chunk of text into structured facts that can be used for graph construction.
+
+        You must extract information only from the input text. Do not add outside knowledge, do not guess, and do not alter the meaning of the original text.
+
+        ## Task:
+        Given one chunk of text, extract:
+
+        1. entities:
+        - A list of entities explicitly mentioned in the text
+        - Do not output pronouns (such as he, she, it, they, his, her, its, their)
+        - Use standard, complete, and uniquely identifiable names whenever possible
+        - Do not casually treat pure attribute words, function words, or generic category words as entities (for example, "actor", "city", and "year" are generally not entities)
+
+        2. facts:
+        - Extract one or more atomic facts
+        - Each fact must express exactly one minimal, independent, and citable fact
+        - Do not merge multiple relations into a single fact
+        - Every fact must be directly supported by the input text
+        - If the text does not contain any clear fact, do not fabricate one; return an empty list
+
+        3. triplets:
+        - Each fact must correspond to one or more triplets
+        - Each triplet must follow the format: [head, relation, tail]
+        - The head and tail should come from entities whenever possible; if not suitable as entities, use the original literal text
+        - The relation should be concise, stable, and semantically clear, preferably as a short phrase, such as:
+          "is", "was born in", "starred", "directed by", "located in", "part of", "published in", "married to"
+        - Triplets must be strictly semantically consistent with their corresponding fact
+
+        ## Important Constraints
+        - Never fabricate information that is not explicitly stated in the input text
+        - Never use background knowledge outside the input text to fill in missing information
+        - Preserve literals such as time, year, number, and title exactly as they appear, for example: "1999", "42", "president"
+        - If one sentence contains multiple facts, split them into multiple atomic facts
+        - If the relation between two entities is unclear, do not force a relation
+        - Do not output duplicate entities
+        - Do not output duplicate facts
+        - Do not output any schema, explanation, or annotation unrelated to the text
+
+        ## Output Format
+        You must output exactly one strictly valid JSON object. Do not output markdown, do not output code fences, and do not output any explanatory text.
+
+        The JSON format is:
+        {
+        "entities": ["Entity 1", "Entity 2"],
+          "facts": [
+            {
+        "fact": "One atomic fact sentence",
+              "triplets": [
+                ["Entity 1", "relation", "Entity 2 or literal"]
+              ]
+            }
+          ]
+        }
+
+        ## Output Requirements
+        - The top level must contain exactly two keys: "entities" and "facts"
+        - "entities" must be an array of strings
+        - "facts" must be an array
+        - Each fact object must contain exactly two keys: "fact" and "triplets"
+        - "fact" must be a string
+        - "triplets" must be an array
+        - Each triplet must have length 3, and all three elements must be strings
+        - Even if nothing can be extracted, you must still output valid JSON, for example:
+          {"entities": [], "facts": []}
+
+        ## Example
+        Input chunk:
+        The Newcomers is a 2000 film starring Chris Evans.
+
+        Output:
+        {
+        "entities": ["The Newcomers", "Chris Evans", "2000"],
+          "facts": [
+            {
+        "fact": "The Newcomers is a 2000 film.",
+              "triplets": [
+                ["The Newcomers", "is", "2000 film"]
+              ]
+            },
+            {
+        "fact": "The Newcomers starred Chris Evans.",
+              "triplets": [
+                ["The Newcomers", "starred", "Chris Evans"]
+              ]
+            }
+          ]
+        }
+
+        ## Input chunk
+        {text}
+
+        ## Output
+        Output JSON only.
+        """
+
+        resp = requests.post(
+            f"{self.ollama_base_url}/api/generate",
+            json={
+                "model": self.llm_model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.0},
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+
+        raw = (resp.json() or {}).get("response", "").strip()
+        js = self._extract_first_json_object(raw)
+        data = json.loads(js)
+
+        entities = data.get("entities")
+        facts_list = data.get("facts")
+
+        if not isinstance(entities, list) or not entities:
+            raise ValueError(f"LLM 抽取 entities 失败或为空: chunk_id={cid}")
+        if not all(isinstance(x, str) and x.strip() for x in entities):
+            raise ValueError(f"LLM 返回 entities 格式不合法: chunk_id={cid}")
+
+        if not isinstance(facts_list, list) or not facts_list:
+            raise ValueError(f"LLM 抽取 facts 失败或为空: chunk_id={cid}")
+
+        facts: List[Dict] = []
+        for idx, item in enumerate(facts_list):
+            if not isinstance(item, dict):
+                raise ValueError(f"facts[{idx}] 不是 dict: chunk_id={cid}")
+
+            fact_text = item.get("fact")
+            triplets = item.get("triplets")
+
+            if not (isinstance(fact_text, str) and fact_text.strip()):
+                raise ValueError(f"facts[{idx}].fact 为空: chunk_id={cid}")
+            if not isinstance(triplets, list) or not triplets:
+                raise ValueError(f"facts[{idx}].triplets 为空或不合法: chunk_id={cid}")
+
+
+            ft_low = fact_text.lower()
+            fact_entities: List[str] = []
+            for e in entities:
+                #用匹配来进行绑定
+                if e.lower() in ft_low:
+                    fact_entities.append(e)
+
+            for tri in triplets:
+                if not (isinstance(tri, list) and len(tri) >= 3):
+                    raise ValueError(f"facts[{idx}].triplets 存在非法三元组: chunk_id={cid}")
+                head, _, tail = tri[0], tri[1], tri[2]
+                if head in entities and head not in fact_entities:
+                    fact_entities.append(head)
+                if tail in entities and tail not in fact_entities:
+                    fact_entities.append(tail)
+
+            if not fact_entities:
+                raise ValueError(f"facts[{idx}] 未能绑定任何实体（严格模式不允许）: chunk_id={cid}")
+
+            facts.append(
+                {
+                    "id": f"{cid}_fact_{idx}",
+                    "text": fact_text.strip(),
+                    "triplets": triplets,
+                    "entity_ids": fact_entities,
+                    "source_chunk_id": cid,
+                }
+            )
 
         return facts, entities
 
-    # -------------------------
-    # Step 2: facts -> propositions
-    # -------------------------
+
+    # 4) Step 2: facts -> propositions
+
     def build_proposition_nodes(self, facts: List[Dict]) -> Tuple[List[Dict], Dict[str, List[str]]]:
-        """
-        构建命题节点：按实体分桶 -> 桶内拼接 -> 按文本去重
+        if not facts:
+            raise ValueError("facts 为空")
 
-        Returns:
-            (propositions, fact_assignments)
-            fact_assignments: prop_id -> [fact_id...]
-        """
-        logger.info(f"构建命题节点: {len(facts)} 个facts")
+        buckets: Dict[str, List[Dict]] = {}
+        for f in facts:
+            eids = f.get("entity_ids")
+            if not eids:
+                raise ValueError(f"fact 缺少 entity_ids: fact_id={f.get('id')}")
+            for e in eids:
+                #如果 e 这个键已经存在，就返回它对应的值，如果不存在，就先创建
+                buckets.setdefault(e, []).append(f)
 
-        # 按实体分桶
-        entity_buckets: Dict[str, List[Dict]] = {}
-        for fact in facts:
-            for entity in (fact.get("entity_ids") or []):
-                entity_buckets.setdefault(entity, []).append(fact)
+        if not buckets:
+            raise ValueError("按实体分桶后 buckets 为空（严格模式）")
+        #开始去重
+        prop_dedup: Dict[str, Dict] = {}
 
-        prop_dedup_map: Dict[str, Dict] = {}
+        for _, bucket_facts in buckets.items():
+            seen = set()
+            uniq_texts: List[str] = []
+            all_entities: Set[str] = set()
+            fact_ids: List[str] = []
+            source_chunks: Set[str] = set()
 
-        for _, bucket_facts in entity_buckets.items():
-            if not bucket_facts:
-                continue
-
-            # 桶内去重拼接
-            seen_texts = set()
-            unique_fact_texts = []
             for f in bucket_facts:
-                t = f.get("text", "")
-                if t and t not in seen_texts:
-                    unique_fact_texts.append(t)
-                    seen_texts.add(t)
+                t = (f.get("text") or "").strip()
+                if not t:
+                    raise ValueError(f"fact text 为空: fact_id={f.get('id')}")
 
-            prop_text = " ".join(unique_fact_texts[:10])  # 最多10个不重复fact
+                if t not in seen:
+                    uniq_texts.append(t)
+                    seen.add(t)
 
-            all_entities = set()
-            for f in bucket_facts:
                 all_entities.update(f.get("entity_ids") or [])
+                if not f.get("id"):
+                    raise ValueError("fact 缺少 id")
+                fact_ids.append(f["id"])
 
-            dedup_key = prop_text  # 保持原逻辑：只按文本去重
+                scid = f.get("source_chunk_id")
+                if not scid:
+                    raise ValueError(f"fact 缺少 source_chunk_id: fact_id={f.get('id')}")
+                source_chunks.add(scid)
 
-            if dedup_key in prop_dedup_map:
-                prop_dedup_map[dedup_key]["entity_ids"].update(all_entities)
-                prop_dedup_map[dedup_key]["fact_ids"].extend([f["id"] for f in bucket_facts if "id" in f])
-            else:
-                prop_dedup_map[dedup_key] = {
+            prop_text = " ".join(uniq_texts[:10]).strip()
+            if not prop_text:
+                raise ValueError("prop_text 为空（严格模式）")
+
+            dedup_key = prop_text
+            #如果这个 proposition 还没出现过就新建
+            if dedup_key not in prop_dedup:
+                prop_dedup[dedup_key] = {
                     "text": prop_text,
-                    "entity_ids": all_entities,
-                    "fact_ids": [f["id"] for f in bucket_facts if "id" in f],
+                    "entity_ids": set(all_entities),
+                    "fact_ids": list(fact_ids),
+                    "source_chunk_ids": set(source_chunks),
                 }
+            #如果出现过就合并
+            else:
+                prop_dedup[dedup_key]["entity_ids"].update(all_entities)
+                prop_dedup[dedup_key]["fact_ids"].extend(fact_ids)
+                prop_dedup[dedup_key]["source_chunk_ids"].update(source_chunks)
 
         propositions: List[Dict] = []
         fact_assignments: Dict[str, List[str]] = {}
 
-        for i, (_, prop_data) in enumerate(prop_dedup_map.items()):
-            prop_id = f"prop_{i}"
-            prop_text = prop_data["text"]
+        for prop_text, pd in prop_dedup.items():
+            #根据 prop_text 生成一个稳定 id
+            pid = self._stable_prop_id(prop_text)
+
+            entity_ids = sorted({x for x in pd["entity_ids"] if isinstance(x, str) and x.strip()})
+            if not entity_ids:
+                raise ValueError(f"P 缺少 entity_ids: prop_id={pid}")
+
+            fact_ids = sorted(set(pd["fact_ids"]))
+            if not fact_ids:
+                raise ValueError(f"P 缺少 fact_ids: prop_id={pid}")
+
+            source_chunk_ids = sorted(set(pd["source_chunk_ids"]))
+            if not source_chunk_ids:
+                raise ValueError(f"P 缺少 source_chunk_ids: prop_id={pid}")
+
             propositions.append(
                 {
-                    "id": prop_id,
+                    "id": pid,
                     "text": prop_text,
-                    "entity_ids": list(prop_data["entity_ids"]),
+                    "entity_ids": entity_ids,
+                    "fact_ids": fact_ids,
+                    "source_chunk_ids": source_chunk_ids,
                     "embedding": self._encode_text(prop_text),
                 }
             )
-            fact_assignments[prop_id] = list(set(prop_data["fact_ids"]))
+            fact_assignments[pid] = fact_ids
 
-        logger.info(f"创建了 {len(propositions)} 个命题节点（按文本去重后）")
+        if not propositions:
+            raise ValueError("propositions 为空")
         return propositions, fact_assignments
 
-    # -------------------------
-    # Step 3: propositions/entities -> concepts
-    # -------------------------
-    def build_concept_nodes_from_props(self, props: List[Dict]) -> List[Dict]:
-        """
-        基于命题的实体集合聚类生成概念节点（逻辑不变）：
-        1) 收集所有实体
-        2) 编码 + KMeans 聚类
-        3) 每簇用 LLM 生成 1-3词概念名
-        """
-        if not props:
-            return []
 
-        logger.info(f"构建概念节点: {len(props)} 个命题")
+    # 5) Step 3: entity -> type
 
-        # 1) 收集实体
-        all_entities = set()
-        for prop in props:
-            all_entities.update(prop.get("entity_ids", []) or [])
-        all_entities = list(all_entities)
-        logger.info(f"收集到 {len(all_entities)} 个唯一实体")
+    def infer_entity_type(self, entity: str, context: str) -> str:
+        canon = self._norm_entity(entity)
 
-        if not all_entities:
-            return []
+        if not canon:
+            raise ValueError("entity为空")
 
-        # 2) 实体编码
-        entity_embeddings = []
-        valid_entities = []
-        for entity in all_entities:
-            try:
-                emb = np.asarray(self._encode_text(entity), dtype=float).flatten()
-                if emb.shape[0] == self.embedding_dim:
-                    entity_embeddings.append(emb)
-                    valid_entities.append(entity)
-                else:
-                    logger.warning(f"实体 '{entity}' embedding维度错误: {emb.shape}, 期望({self.embedding_dim},)")
-            except Exception as e:
-                logger.warning(f"实体 '{entity}' 编码失败: {e}")
+        if canon in self.type_cache:
 
-        if not entity_embeddings:
-            logger.warning("没有有效的实体embeddings，跳过概念节点构建")
-            return []
+            t = str(self.type_cache[canon]).strip().upper()
+            if t not in self.type_label_set:
+                raise ValueError(f"type_cache 中存在非法标签: {t} for entity={entity}")
+            return t
 
-        all_entities = valid_entities
-        entity_embeddings = np.vstack(entity_embeddings)
-
-        # 3) 聚类数：sqrt 自适应
-        n_entities = len(all_entities)
-        min_k = 20
-        max_k = 1000
-        n_clusters = int(np.sqrt(n_entities))
-        n_clusters = max(min_k, n_clusters)
-        n_clusters = min(max_k, n_clusters, n_entities)
-
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        labels = kmeans.fit_predict(entity_embeddings)
-
-        # 4) 概念节点
-        concepts: List[Dict] = []
-        for i in range(n_clusters):
-            idx = np.where(labels == i)[0]
-            cluster_entities = [all_entities[j] for j in idx]
-
-            concept_text = self._generate_concept_text_from_entities(cluster_entities)
-
-            concepts.append(
-                {
-                    "id": f"concept_{i}",
-                    "text": concept_text,
-                    "entity_ids": cluster_entities,
-                    "embedding": kmeans.cluster_centers_[i].astype(float).tolist(),
-                }
-            )
-
-        logger.info(f"创建了 {len(concepts)} 个概念节点")
-        return concepts
-
-    def _generate_concept_text_from_entities(self, cluster_entities: List[str]) -> str:
-        """使用 LLM 从实体列表生成概念文本（1-3词）"""
-        if not cluster_entities:
-            return "Concept"
-
-        entities_str = ", ".join(cluster_entities[:10])
+        #把所有可选标签拼成一个字符串，中间用 | 连接
+        labels_str = " | ".join(self.type_labels)
+        ctx = context.strip()
+        if len(ctx) > 220:
+            ctx = ctx[:220]
 
         prompt = f"""# Role
-You are a concept extraction expert who identifies the core concept from a list of entities.
+        You are an entity type classifier for evidence-graph construction.
 
-# Task
-Extract a SHORT concept name (1-3 words) that represents the main theme connecting these entities.
+        # Task
+        Given:
+        1. one entity string
+        2. one short context snippet
 
-# Instructions
-- Output ONLY 1-3 words
-- Use a noun or noun phrase
-- Capture the core concept that connects the entities
-- Do NOT write full sentences
+        choose exactly one label for the entity from the allowed labels.
 
-# Examples
-Entities: Albert Einstein, theory of relativity, physics, Nobel Prize
-Output: "Theoretical Physics"
+        # Allowed labels
+        {labels_str}
 
-Entities: Paris, France, capital, Eiffel Tower
-Output: "French Capital"
+        # Labeling rules
+        1. You must classify ONLY based on the given entity string and the given context.
+        2. Do NOT use outside world knowledge unless it is explicitly supported by the context.
+        3. If the entity refers to a human, real person, fictional character, or named individual, choose "PERSON".
+        4. If the entity refers to a geographic location, place, region, country, city, state, province, continent, or other physical location, choose "LOCATION".
+        5. Otherwise, choose "OTHER".
+        6. If the context is insufficient or ambiguous, choose the most conservative label.
+        7. Do NOT explain your reasoning.
+        8. Output exactly one JSON object and nothing else.
 
-Entities: 1905, publication, special relativity
-Output: "Relativity Publication"
+        # Important boundary cases
+        - film / book / organization / company / award / event / brand / school / universe / series / concept -> OTHER
+        - nationality / language / date / year / occupation / role / genre -> OTHER
+        - fictional people with personal names -> PERSON
+        - named places in fictional or real settings -> LOCATION
 
-# Your Task
-Entities: {entities_str}
+        # Output format
+        {{"type":"<ONE_LABEL>"}}
 
-Concept (1-3 words only):"""
+        # Valid output examples
+        {{"type":"PERSON"}}
+        {{"type":"LOCATION"}}
+        {{"type":"OTHER"}}
 
-        try:
-            response = requests.post(
-                f"{self.ollama_base_url}/api/generate",
-                json={
-                    "model": self.llm_model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"num_predict": 10, "temperature": 0.3},
-                },
-                timeout=30,
-            )
-            response.raise_for_status()
-            concept_text = (response.json() or {}).get("response", "").strip()
-            if concept_text:
-                return concept_text
-        except Exception as e:
-            logger.warning(f"LLM概念生成失败: {e}")
+        # Input
+        Entity: "{entity}"
+        Context: "{ctx}"
 
-     
-        return f"Concept: {', '.join(cluster_entities[:3])}"
-
-    def _generate_concept_text_from_entities(self, cluster_entities: List[str]) -> str:
+        # Output
+        Return JSON only.
         """
-        使用 LLM 从实体列表生成概念文本（1-3词）
+        resp = requests.post(
+            f"{self.ollama_base_url}/api/generate",
+            json={
+                "model": self.llm_model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.0, "num_predict": 40},
+            },
+            timeout=90,
+        )
+        resp.raise_for_status()
 
-        输入：一个概念簇内的实体列表，例如：
-            ["Albert Einstein", "theory of relativity", "physics", "Nobel Prize"]
-        输出：一个短概念名，例如：
-            "Theoretical Physics"
+        raw = (resp.json() or {}).get("response", "").strip()
+        js = self._extract_first_json_object(raw)
+        data = json.loads(js)
 
-        目的：把 entity cluster 压缩成可读的 concept label（Z 节点 text）
-        """
-        if not cluster_entities:
-            return "Concept"
+        if "type" not in data:
+            raise ValueError(f"LLM type 输出缺少 'type' 字段: entity={entity}")
 
-        # 只取前 100 个实体，控制 prompt 长度，避免 LLM 输入爆炸
-        entities_str = ", ".join(cluster_entities[:100])
+        t = str(data["type"]).strip().upper()
+        if t not in self.type_label_set:
+            raise ValueError(f"LLM type 输出不在允许集合内: type={t} entity={entity}")
 
-        prompt = f"""# Role
-    You are a concept extraction expert who identifies the core concept from a list of entities.
-
-    # Task
-    Extract a SHORT concept name (1-3 words) that represents the main theme connecting these entities.
-
-    # Instructions
-    - Output ONLY 1-3 words
-    - Use a noun or noun phrase
-    - Capture the core concept that connects the entities
-    - Do NOT write full sentences
-
-    # Examples
-    Entities: Albert Einstein, theory of relativity, physics, Nobel Prize
-    Output: "Theoretical Physics"
-
-    Entities: Paris, France, capital, Eiffel Tower
-    Output: "French Capital"
-
-    Entities: 1905, publication, special relativity
-    Output: "Relativity Publication"
-
-    # Your Task
-    Entities: {entities_str}
-
-    Concept (1-3 words only):"""
-
-        try:
-            # 调用 Ollama generate：让 LLM 输出概念名
-            response = requests.post(
-                f"{self.ollama_base_url}/api/generate",
-                json={
-                    "model": self.llm_model,
-                    "prompt": prompt,
-                    "stream": False,
-                    # num_predict=10 基本够 1-3 个词；temperature=0.3 保持一定多样性但不太发散
-                    "options": {"num_predict": 10, "temperature": 0.3},
-                },
-                timeout=30,
-            )
-            response.raise_for_status()
-            concept_text = (response.json() or {}).get("response", "").strip()
-
-            # 若 LLM 返回非空，直接使用
-            if concept_text:
-                return concept_text
-        except Exception as e:
-            logger.warning(f"LLM概念生成失败: {e}")
-
-        # 降级策略：不用 LLM 时，用前三个实体拼一个占位概念
-       
-        return f"Concept: {', '.join(cluster_entities[:3])}"
+        # 写缓存
+        self.type_cache[canon] = t
+        if self.flush_type_cache_each_write:
+            self._save_type_cache()
+        return t
 
 
-    # -------------------------
-    # Summary 节点生成：简单召回 + LLM 分组
-    # -------------------------
-    def _call_llm_for_summary(self, chunks: List[Dict]) -> str:
-        """
-        调用 LLM 为一组 chunks 生成 2-3 句摘要，强调逻辑连接
+    # 6) 主入口：构建 E–P–E 图
 
-        设计：
-        - 只选前 5 个 chunk（控制 prompt 长度）
-        - 每个 chunk 最多截取 800 字符
-        - 强制 summary 输出包含逻辑连接词（because/therefore/...）
-        - 禁止编造 chunk 里没有的事实
-        """
-        selected = chunks[:5]
-        block = []
-        for i, c in enumerate(selected, start=1):
-            # 给每段 chunk 加上编号与 id，便于 LLM 引用和对齐
-            block.append(f"[Chunk {i} | id={c.get('id')}]\n{(c.get('text') or '').strip()[:800]}")
-        combined = "\n\n".join(block)
+    def build_heterogeneous_graph(self, chunks: List[Dict]) -> nx.DiGraph:
 
-        prompt = f"""# Role
-    You are a professional summarizer and reasoning writer.
-
-    # Task
-    Write a 2-3 sentence summary that:
-    1) captures the key information across the chunks, and
-    2) explicitly describes the logical relationship between them.
-
-    # Requirements
-    - 2-3 sentences total
-    - MUST include explicit logical connectors (because/therefore/however/first...then/as a result/if...then)
-    - Do NOT invent facts not present in the chunks
-
-    # Input
-    {combined}
-
-    Summary (2-3 sentences):"""
-
-        try:
-            resp = requests.post(
-                f"{self.ollama_base_url}/api/generate",
-                json={
-                    "model": self.llm_model,
-                    "prompt": prompt,
-                    "stream": False,
-                   
-                    "options": {"temperature": 0.2, "num_predict": 240},
-                },
-                timeout=50,
-            )
-            resp.raise_for_status()
-            out = resp.json()["response"].strip()
-
-            # 若 LLM 输出为空，降级返回截断后的输入（至少不至于空 summary）
-            return out if out else combined[:250]
-        except Exception as e:
-            logger.warning(f"LLM摘要生成失败: {e}")
-            return combined[:250]
-
-
-    def _cosine_topk(self, embs: np.ndarray, top_k: int) -> List[List[Tuple[int, float]]]:
-        """
-        计算每个向量的 top-k 余弦相似邻居（排除自身）
-
-        输入：
-            embs: (N, D) 向量矩阵
-            top_k: 每个点取多少近邻
-        输出：
-            out[i] = [(j, sim_ij), ...]  (长度 top_k)
-        """
-        # 归一化到单位向量，避免 dot 受模长影响
-        norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-10
-        u = embs / norms
-
-        # 相似度矩阵 sim = U * U^T，形状 (N, N)
-        #第 i 行：向量 i 和所有向量的相似度
-        #第 j 列：所有向量和向量 j 的相似度
-        sim = u @ u.T
-
-        # 排除自身：把对角线设为 -1，避免 topk 选到自己
-        np.fill_diagonal(sim, -1.0)
-
-        out = []
-        # top_k 不能超过行数 N-1
-        top_k = min(top_k, sim.shape[0] - 1)
-
-        for i in range(sim.shape[0]):
-            # argpartition：O(N) 取前 top_k 大的索引列表
-            idx = np.argpartition(sim[i], -top_k)[-top_k:]
-            # 再按相似度降序排列
-            idx = idx[np.argsort(sim[i][idx])[::-1]]
-
-            #最后输出的是 类似于
-            #out = [
-                    #[(2, 0.707), (1, 0.0)],  # 对 0
-                    #[(2, 0.707), (0, 0.0)],  # 对 1
-                    #[(0, 0.707), (1, 0.707)] # 对 2
-                    #]
-         
-            out.append([(int(j), float(sim[i, j])) for j in idx])
-        return out
-
-
-    def _build_candidate_graph(self, chunks: List[Dict]) -> nx.Graph:
-        """
-        构建候选相关图 UG（无向图）：
-
-        步骤：
-        1) 为每个 chunk 准备 embedding（缺失则编码）
-        2) 为每个 chunk 提取实体集合 entity_ids（归一化后放 set）
-        3) 对每个 chunk 计算 topK 余弦近邻
-        4) 对每个 (i, neighbor) 判断是否建边：
-            - cos >= edge_cosine_threshold  或
-            - shared_entities_count >= entity_overlap_threshold
-        满足任一条件则连边，并记录：
-            - weight（优先用 cosine，否则给一个固定权重 0.70）
-            - cosine
-            - shared_entities（最多 10 个）
-
-        可选：cross_doc_only=True 时，只允许跨文档连边（同 doc 的边被丢弃）
-        """
-        UG = nx.Graph()
         if not chunks:
-            return UG
+            raise ValueError("chunks 为空")
 
-        # 只有 1 个 chunk：只加节点，不加边
-        if len(chunks) < 2:
-            for c in chunks:
-                UG.add_node(c["id"], doc_id=self._safe_doc_id(c))
-            return UG
+        G = nx.DiGraph()
 
-        ids = [c["id"] for c in chunks]
-
-        # 1) 准备 embedding 矩阵 embs: (N, D)
-        embs = []
+        # ---------- (A) 加入 C 节点（证据容器）----------
         for c in chunks:
-            if "embedding" not in c or c["embedding"] is None:
-                # 缺 embedding 就直接再编码
-                c["embedding"] = self._encode_text(c.get("text", ""))
-            embs.append(np.asarray(c["embedding"], dtype=float))
-        embs = np.vstack(embs)  # (N, D)
+            cid = c.get("id")
+            if not cid:
+                raise ValueError("chunk 缺少 id")
+            if not (isinstance(c.get("text"), str) and c["text"].strip()):
+                raise ValueError(f"chunk 缺少 text: chunk_id={cid}")
 
-        # 2) 为每个 chunk 构建实体集合（归一化后存 set）
-        chunk_entities: Dict[str, set] = {}
-        for c in chunks:
-            raw = c.get("entity_ids", []) or []
-            chunk_entities[c["id"]] = {self._norm_entity(x) for x in raw if self._norm_entity(x)}
-
-        # 3) 计算每个 chunk 的 topK 近邻（排除自身）
-        topk = self._cosine_topk(embs, top_k=self.recall_top_k)
-
-        # 4) 先把所有节点放入图，并记录 doc_id
-        for c in chunks:
-            UG.add_node(c["id"], doc_id=self._safe_doc_id(c))
-
-        # 下标 -> chunk_id
-        id_at = {i: ids[i] for i in range(len(ids))}
-
-        # 5) 遍历近邻，按阈值规则建边
-        for i, cid in enumerate(ids):
-            doc_i = UG.nodes[cid]["doc_id"]
-            for j, cos in topk[i]:
-                nid = id_at[j]
-                doc_j = UG.nodes[nid]["doc_id"]
-
-                # 只允许跨文档边
-                if self.cross_doc_only and doc_i == doc_j:
-                    continue
-
-                # 实体交集
-                inter = chunk_entities[cid] & chunk_entities[nid]
-                ent_ok = len(inter) >= self.entity_overlap_threshold if self.entity_overlap_threshold > 0 else False
-
-                # 余弦阈值
-                cos_ok = cos >= self.edge_cosine_threshold
-
-                # 只要 cosine 或实体交集满足，就建边
-                if cos_ok or ent_ok:
-                    # 权重策略：cos_ok 用 cosine 作为 weight，否则用固定 0.70（可视为“弱边”）
-                    w = float(cos) if cos_ok else 0.70
-                    UG.add_edge(
-                        cid,
-                        nid,
-                        weight=w,
-                        cosine=float(cos),
-                        shared_entities=list(inter)[:10],
-                    )
-
-        return UG
-
-
-    def _initial_groups_by_connected_components(self, UG: nx.Graph) -> List[List[str]]:
-        """
-        用连通分量得到初始相关簇（connected components）
-
-        输出是按簇大小从大到小排序的 chunk_id 列表集合。
-        """
-        if UG.number_of_nodes() == 0:
-            return []
-        comps = [list(c) for c in nx.connected_components(UG)]
-        comps.sort(key=len, reverse=True)
-        return comps
-
-
-    def _llm_group_chunk_ids(self, chunk_items: List[Dict], max_groups: int = 8) -> List[List[str]]:
-        """
-        LLM 对小规模 chunk 集合做“逻辑分组”
-
-        输入:
-            chunk_items: [{"id":..., "text":...}, ...]
-        输出:
-            [[id1, id2], [id3], ...]  （只返回 chunk_id 分组）
-
-        重要约束：
-        - 每个 chunk id 必须出现在且只出现在一个 group
-        - 组内优先 2-5 个 chunk
-        - 最多 max_groups 个组，超了就合并近似组
-
-        失败降级：
-        - 若 LLM/JSON 解析失败：每个 chunk 单独成组（singleton）
-        """
-        if not chunk_items:
-            return []
-        if len(chunk_items) == 1:
-            return [[chunk_items[0]["id"]]]
-
-        # 控制输入长度：每段 text 截断 500 字符
-        items = [{"id": x["id"], "text": (x.get("text") or "").strip()[:500]} for x in chunk_items]
-        items_json = json.dumps(items, ensure_ascii=False, indent=2)
-
-        prompt = f"""# Role
-    You are an expert analyst for chunk understanding.
-
-    # Task
-    Group the given chunks into clusters based on LOGICAL relatedness across documents.
-    Logical relatedness includes:
-    - cause-effect
-    - contrast
-    - progression
-    - condition-conclusion
-    - timeline
-    - problem-solution
-    - other
-
-    # Output Requirements
-    - Output ONLY valid JSON.
-    - JSON schema:
-    {{
-    "groups": [
-        {{
-        "group_id": "g0",
-        "relation_type": "cause-effect | contrast | progression | condition-conclusion | timeline | problem-solution | other",
-        "rationale": "one short sentence explaining the logical connection",
-        "chunk_ids": ["c1", "c7"]
-        }}
-    ]
-    }}
-    - Each chunk id must appear in exactly ONE group.
-    - Prefer 2-5 chunks per group when possible.
-    - If unrelated, keep singleton.
-    - Create at most {max_groups} groups; merge the closest groups if needed.
-
-    # Input chunks (JSON):
-    {items_json}
-
-    Output (JSON only):"""
-
-        try:
-            resp = requests.post(
-                f"{self.ollama_base_url}/api/generate",
-                json={
-                    "model": self.llm_model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.2, "num_predict": 700},
-                },
-                timeout=60,
-            )
-            resp.raise_for_status()
-            raw = (resp.json() or {}).get("response", "").strip()
-
-            # 从可能包含多余文本的 raw 中抽取第一个 JSON 对象字符串
-            json_str = self._extract_first_json_object(raw)
-            data = json.loads(json_str)
-
-            groups = data.get("groups", []) or []
-            if not groups:
-                raise ValueError("LLM returned empty groups")
-
-            used = set()
-            out: List[List[str]] = []
-            all_ids = {x["id"] for x in items}
-
-            # 按 LLM 给出的 groups 顺序收集 chunk_ids，并去重，保证每个 chunk 只被分配一次
-            for g in groups:
-                ids = g.get("chunk_ids", []) or []
-                ids = [cid for cid in ids if cid in all_ids]  # 过滤非法 id
-                ids_uniq = []
-                for cid in ids:
-                    if cid not in used:
-                        ids_uniq.append(cid)
-                        used.add(cid)
-                if ids_uniq:
-                    out.append(ids_uniq)
-
-            # 对未被覆盖的 chunk，补单例组，保证“每个 chunk 都在某个 group 里”
-            for cid in all_ids:
-                if cid not in used:
-                    out.append([cid])
-
-            return out
-
-        except Exception as e:
-            logger.warning(f"LLM分组失败，降级为每个chunk单独成组: {e}")
-            return [[x["id"]] for x in chunk_items]
-
-
-    def build_summary_nodes_simple_then_llm(self, chunks: List[Dict]) -> List[Dict]:
-        """
-        Summary 节点生成（简单召回 + LLM 分组）
-
-        Pipeline：
-        1) 构建候选相关图 UG（embedding + entity overlap 建边）
-        2) 取连通分量得到初始簇（粗分组）
-        3) 每个初始簇交给 LLM 做逻辑细分（细分组）
-        4) 对每个最终组生成 summary 节点，并记录 source_chunk_ids
-
-        输出：
-            summary_nodes: List[Dict]，每个 dict 包含：
-                - id
-                - text (summary)
-                - source_chunk_ids
-                - embedding (summary embedding)
-        """
-        if not chunks:
-            return []
-
-        # 1) 构图
-        UG = self._build_candidate_graph(chunks)
-
-        # 2) 初始簇：连通分量
-        initial_groups = self._initial_groups_by_connected_components(UG)
-        if not initial_groups:
-            return []
-
-        # 这里我是固定阈值的，后面感觉需要修改为动态
-        initial_groups = initial_groups[: max(1, self.max_groups * 10)]
-
-        # 方便通过 id 快速取 chunk
-        id_to_chunk = {c["id"]: c for c in chunks if c.get("id")}
-        final_groups: List[List[str]] = []
-
-        # 3) 对每个初始簇做 LLM 细分
-        for comp in initial_groups:
-            comp = [cid for cid in comp if cid in id_to_chunk]
-            if not comp:
-                continue
-
-            # 如果簇太大，按 max_llm_group_input 切块，分批喂给 LLM
-            # 但是这里：切块会破坏全局最优分组（因为跨子块的逻辑关系无法被 LLM 看到）
-            if len(comp) > self.max_llm_group_input:
-                for i in range(0, len(comp), self.max_llm_group_input):
-                    sub = comp[i : i + self.max_llm_group_input]
-                    items = [{"id": cid, "text": id_to_chunk[cid].get("text", "")} for cid in sub]
-                    llm_groups = self._llm_group_chunk_ids(items, max_groups=8)
-                    final_groups.extend(llm_groups)
+            if "embedding" in c and c["embedding"] is not None:
+                vec = np.asarray(c["embedding"], dtype=float).flatten()
+                if vec.shape[0] != self.embedding_dim:
+                    raise ValueError(f"chunk embedding 维度错误: chunk_id={cid}")
+                emb = vec.tolist()
             else:
-                items = [{"id": cid, "text": id_to_chunk[cid].get("text", "")} for cid in comp]
-                llm_groups = self._llm_group_chunk_ids(items, max_groups=8)
-                final_groups.extend(llm_groups)
+                emb = self._encode_text(c["text"])
 
-        # 只保留前 max_groups 个最终组（按组大小降序），避免 summary 节点数量失控
-        final_groups = sorted(final_groups, key=len, reverse=True)[: self.max_groups]
-
-        # 4) 生成 summary 节点
-        summary_nodes: List[Dict] = []
-        for idx, gids in enumerate(final_groups):
-            group_chunks = [id_to_chunk[cid] for cid in gids if cid in id_to_chunk]
-            if not group_chunks:
-                continue
-
-            summary_text = self._call_llm_for_summary(group_chunks)
-
-            summary_nodes.append(
-                {
-                    "id": f"summary_{idx}",
-                    "text": summary_text,
-                    "source_chunk_ids": [c["id"] for c in group_chunks],
-                    "embedding": self._encode_text(summary_text),
-                }
+            G.add_node(
+                cid,
+                node_type="chunk",
+                text=c["text"],
+                embedding=emb,
             )
 
-        return summary_nodes
-
-
-    # -------------------------
-    # SIMILAR_TO 边
-    # -------------------------
-    def add_similarity_edges(self, graph: nx.Graph, node_type: str, top_k: int, sim_threshold: float) -> None:
-        """
-        在同类型节点之间添加 SIMILAR_TO 边（余弦相似 >= threshold）
-        逻辑保持“同类型内部 topK 近邻建边”的常见做法。
-        """
-        nodes = [n for n, d in graph.nodes(data=True) if d.get("node_type") == node_type]
-        if len(nodes) < 2:
-            return
-
-        embs = []
-        for n in nodes:
-            emb = graph.nodes[n].get("embedding")
-            if emb is None:
-                txt = graph.nodes[n].get("text", "")
-                emb = self._encode_text(txt)
-                graph.nodes[n]["embedding"] = emb
-            embs.append(np.asarray(emb, dtype=float))
-        X = np.vstack(embs)
-
-        neigh = self._cosine_topk(X, top_k=min(top_k, len(nodes) - 1))
-
-        for i, n1 in enumerate(nodes):
-            for j, cos in neigh[i]:
-                if cos < sim_threshold:
-                    continue
-                n2 = nodes[j]
-                if n1 == n2:
-                    continue
-                # 去重：无向图只保留一次；若是有向图也没关系
-                if graph.has_edge(n1, n2):
-                    # 不覆盖已有边类型（例如 HAS_PROP/HAS_CONCEPT），只在没有边时或边类型不同才加
-                    # 这里保持谨慎：若已有边则跳过
-                    continue
-                graph.add_edge(n1, n2, edge_type="SIMILAR_TO", weight=float(cos), cosine=float(cos))
-
-    # -------------------------
-    # 主入口：构建异构图
-    # -------------------------
-    def build_heterogeneous_graph(self, chunks_coref: List[Dict]) -> nx.Graph:
-        """
-        构建包含 chunk / proposition / concept / summary 四类节点的异构图（不包含关系节点 R）
-       
-        1) chunks: 抽取 facts/entities + embedding；加入图
-        2) propositions: 优先使用预构建，否则由 facts 构建；加入图
-        3) C->P: HAS_PROP
-        4) concepts: 由 props 生成；加入图
-        5) C->Z: HAS_CONCEPT（按实体命中）
-        6) summaries: simple recall + LLM grouping；加入图并连 C->S: SUMMARIZED_BY
-        7) 同类型 SIMILAR_TO
-        """
-        graph = nx.Graph()
-        if not chunks_coref:
-            return graph
-
-        # 1) 加入 chunk 节点，并抽取 facts/entities
+        # ---------- (B) 抽取 facts/entities，并准备 entity 的轻上下文 ----------
         all_facts: List[Dict] = []
-        for chunk in chunks_coref:
-            facts, entity_ids = self.extract_facts_and_entities_from_chunk(chunk)
-            chunk["entity_ids"] = entity_ids
-            chunk["facts"] = facts
+        #实体识别的上下文（避免歧义）
+        entity_ctx: Dict[str, str] = {}
+
+        for c in chunks:
+            cid = c["id"]
+            facts, entities = self.extract_facts_and_entities_from_chunk(c)
+
+            if not entities:
+                raise ValueError(f"chunk entities 为空: chunk_id={cid}")
+
+            # 同一实体首次出现的 chunk 作为上下文
+            for e in entities:
+                canon = self._norm_entity(e)
+                if canon and canon not in entity_ctx:
+                    entity_ctx[canon] = c["text"]
+
             all_facts.extend(facts)
 
-            if "embedding" not in chunk or chunk["embedding"] is None:
-                chunk["embedding"] = self._encode_text(chunk.get("text", ""))
 
-            graph.add_node(chunk["id"], node_type="chunk", **chunk)
+            G.nodes[cid]["entity_mentions"] = entities
+            G.nodes[cid]["facts_extracted"] = facts
 
-        # 2) 构建 proposition 节点
-        all_propositions: List[Dict] = []
-        seen_prop_ids = set()
-        for chunk in chunks_coref:
-            if "propositions" in chunk and chunk["propositions"]:
-                for prop in chunk["propositions"]:
-                    pid = prop.get("id")
-                    if pid and pid not in seen_prop_ids:
-                        all_propositions.append(prop)
-                        seen_prop_ids.add(pid)
+        if not all_facts:
+            raise ValueError("全局 all_facts 为空")
 
-        if all_propositions:
-            logger.info(f"使用预构建的propositions: {len(all_propositions)} 个")
-            props = all_propositions
-            fact_assignments = {p["id"]: p.get("fact_ids", []) for p in props if p.get("id")}
-        else:
-            logger.info(f"使用提取的facts构建propositions: {len(all_facts)} 个facts")
-            props, fact_assignments = self.build_proposition_nodes(all_facts)
+        # ---------- (C) 构建 P 节点（推理核心）----------
+        props, _ = self.build_proposition_nodes(all_facts)
 
-        for prop in props:
-            if "embedding" not in prop or prop["embedding"] is None:
-                prop["embedding"] = self._encode_text(prop.get("text", ""))
-            graph.add_node(prop["id"], node_type="proposition", **prop)
+        for p in props:
+            pid = p["id"]
+            G.add_node(
+                pid,
+                node_type="proposition",
+                text=p["text"],
+                embedding=p["embedding"],
+                entity_ids=p["entity_ids"],
+                fact_ids=p["fact_ids"],
+                source_chunk_ids=p["source_chunk_ids"],
+            )
 
-        # 3) C -> P 边
-        fact_to_chunk = {f["id"]: f.get("source_chunk_id") for f in all_facts if f.get("id")}
-        for prop_id, fact_ids in fact_assignments.items():
-            for fact_id in (fact_ids or []):
-                chunk_id = fact_to_chunk.get(fact_id)
-                if chunk_id:
-                    graph.add_edge(chunk_id, prop_id, edge_type="HAS_PROP", weight=1.0)
+            # P -> C（
+            for cid in p["source_chunk_ids"]:
+                if not G.has_node(cid):
+                    raise ValueError(f"P 引用了不存在的 chunk: prop_id={pid} chunk_id={cid}")
+                G.add_edge(pid, cid, edge_type="SUPPORTED_BY", weight=1.0)
 
-        # 4) 构建 concept 节点
-        concepts = self.build_concept_nodes_from_props(props)
-        for concept in concepts:
-            graph.add_node(concept["id"], node_type="concept", **concept)
+        # ---------- (D) 构建 E 节点、Z 节点，并连 EP / EZ ----------
+        created_entities: Set[str] = set()
 
-        # 5) C -> Z 边（按实体命中）
-        entity_to_concepts: Dict[str, set] = {}
-        concept_norm_entities: Dict[str, set] = {}
+        for p in props:
+            pid = p["id"]
+            ent_node_ids: List[str] = []
 
-        for concept in concepts:
-            cid = concept["id"]
-            norm_set = set()
-            for e in (concept.get("entity_ids", []) or []):
-                ne = self._norm_entity(e)
-                if ne:
-                    norm_set.add(ne)
-                    entity_to_concepts.setdefault(ne, set()).add(cid)
-            concept_norm_entities[cid] = norm_set
+            for e in p["entity_ids"]:
+                canon = self._norm_entity(e)
+                if not canon:
+                    raise ValueError(f"实体 canonicalize 为空: entity={e} prop_id={pid}")
 
-        for chunk in chunks_coref:
-            chunk_id = chunk["id"]
-            raw_entities = graph.nodes[chunk_id].get("entity_ids", []) or []
-            chunk_norm_entities = {self._norm_entity(e) for e in raw_entities if self._norm_entity(e)}
-            if not chunk_norm_entities:
-                continue
+                eid = self._entity_node_id(e)
+                ent_node_ids.append(eid)
 
-            linked_concepts = set()
-            for ne in chunk_norm_entities:
-                linked_concepts.update(entity_to_concepts.get(ne, set()))
+                if not G.has_node(eid):
 
-            for cid in linked_concepts:
-                overlap = len(chunk_norm_entities & concept_norm_entities.get(cid, set()))
-                w = overlap / max(1, len(chunk_norm_entities))
-                graph.add_edge(chunk_id, cid, edge_type="HAS_CONCEPT", weight=float(w))
+                    G.add_node(
+                        eid,
+                        node_type="entity",
+                        text=e,
+                        canonical=canon,
+                        embedding=self._encode_text(canon),
+                    )
 
-        # 6) 构建 summary 节点
-        summary_nodes = self.build_summary_nodes_simple_then_llm(chunks_coref)
-        for s in summary_nodes:
-            graph.add_node(s["id"], node_type="summary", **s)
-            for cid in s.get("source_chunk_ids", []) or []:
-                graph.add_edge(cid, s["id"], edge_type="SUMMARIZED_BY", weight=1.0)
+                # 每个实体只做一次 typing
+                if eid not in created_entities:
+                    created_entities.add(eid)
 
-        # 7) 添加 SIMILAR_TO 边
-        self.add_similarity_edges(graph, "chunk", top_k=5, sim_threshold=0.7)
-        self.add_similarity_edges(graph, "proposition", top_k=10, sim_threshold=0.7)
-        self.add_similarity_edges(graph, "concept", top_k=5, sim_threshold=0.75)
-        self.add_similarity_edges(graph, "summary", top_k=3, sim_threshold=0.7)
+                    ctx = entity_ctx.get(canon, "")
+                    t = self.infer_entity_type(e, ctx)
 
-        logger.info(f"异构图构建完成: {graph.number_of_nodes()} 个节点, {graph.number_of_edges()} 条边")
-        return graph
+                    zid = self._type_node_id(t)
+                    if not G.has_node(zid):
+                        G.add_node(zid, node_type="type", text=t)
+
+                    # E -> Z
+                    G.add_edge(eid, zid, edge_type="IS_A", weight=1.0)
+
+                # EP 双向边
+                G.add_edge(eid, pid, edge_type="INVOLVED_IN", weight=1.0)
+                G.add_edge(pid, eid, edge_type="ASSERTS", weight=1.0)
+
+            # 写回 proposition 的 entity_node_ids
+            G.nodes[pid]["entity_node_ids"] = ent_node_ids
+
+        # (D) 离线：结构先验（只算一次）
+        from src.offline_struct_prior import compute_and_write_struct_prior
+
+        sc_cfg = (self.config.get("structural_centrality", {}) or {})
+        compute_and_write_struct_prior(
+            G,
+            alpha_core=float(sc_cfg.get("alpha_core", 0.5)),
+            alpha_betw=float(sc_cfg.get("alpha_betw", 0.5)),
+            attr="s_struct_global",
+        )
+
+
+        # (E) 落盘 cache
+        self._save_type_cache()
+
+        logger.info("构图完成: nodes=%d edges=%d", G.number_of_nodes(), G.number_of_edges())
+        return G
