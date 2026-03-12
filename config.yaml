@@ -1,57 +1,63 @@
-# Minimal config for your current IG-RWR Multi-hop RAG codebase (actually used fields only)
+config = {
+  "coarse_retrieval": {
+    "top_k_dense": 100,
+    "top_k_final": 50,
+    "lambda_dense": 1.0,
+    "lambda_sparse": 0.0,
+    "ollama_base_url": "http://localhost:11434",
+    "top_k_final_parallel": 80,   # Parallel 单轮粗检
+    "top_k_final_seq1": 30,       # Sequential 第一轮
+    "top_k_final_seq2": 60,
+  },
+  "graph_construction": {
+    "ollama_base_url": "http://localhost:11434",
+    "llm_model": "qwen2.5:14b",
+    "hf_tokenizer_name": "BAAI/bge-m3",
+    "max_tokens_per_chunk": 300,
+    "dedup_by_title": True,
 
-coarse_retrieval:
-  top_k_dense: 100
-  top_k_final: 50
-  lambda_dense: 1.0
-  lambda_sparse: 0.0
-  ollama_base_url: "http://localhost:11434"
+    "entity_similarity_threshold": 0.8,
+    "proposition_similarity_threshold": 0.7,
+    "concept_similarity_threshold": 0.75,
+    "summary_similarity_threshold": 0.7,
+    "concept_num_clusters": 20,
 
-graph_construction:
-
-  entity_similarity_threshold: 0.8
-  concept_num_clusters: 20
-  proposition_similarity_threshold: 0.7
-  concept_similarity_threshold: 0.75
-  summary_similarity_threshold: 0.7
-  ollama_base_url: "http://localhost:11434"
-  llm_model: "qwen2.5:14b"
-  
-  # 简单召回与分组参数
-  recall_top_k: 25                    # embedding 近邻候选数
-  edge_cosine_threshold: 0.72         # 建边的余弦相似度门槛
-  entity_overlap_threshold: 1         # 实体交集个数门槛
-  cross_doc_only: true                # 强制跨文档建边
-  max_groups: 8                       # 最终最多 summary 组数
-  max_llm_group_input: 12             # 每次喂给 LLM 的 chunk 数上限
-
-subgraph:
-  hops: 2
-
-semantic_anchor:
-  tau_sem: 0.25
-  top_k_fallback: 5
-  llm_model: "qwen2.5:14b"
-  ollama_base_url: "http://localhost:11434"
-
-structural_centrality:
-  alpha_core: 0.5
-  alpha_betw: 0.5
-  k0: 10
-
-intent_representation:
-  ollama_base_url: "http://localhost:11434"
-  llm_model: "qwen2.5:14b"
-
-answer_generation:
-  k_c: 5
-  k_p: 3
-  k_z: 2
-  k_s: 2
-  llm_model: "qwen2.5:14b"
-  ollama_base_url: "http://localhost:11434"
-
-graph_construction:
-  max_tokens_per_chunk: 300
-  hf_tokenizer_name: "BAAI/bge-m3"
-  dedup_by_title: true
+    "recall_top_k": 25,
+    "edge_cosine_threshold": 0.72,
+    "entity_overlap_threshold": 1,
+    "cross_doc_only": True,
+    "max_groups": 8,
+    "max_llm_group_input": 12,
+  },
+  "subgraph": {"hops": 2},
+  "semantic_anchor": {
+    "tau_sem": 0.25,
+    "top_k_fallback": 5,
+    "llm_model": "qwen2.5:14b",
+    "ollama_base_url": "http://localhost:11434",
+  },
+  "structural_centrality": {
+    "alpha_core": 0.5,
+    "alpha_betw": 0.5,
+    "k0": 10,
+  },
+  "intent_representation": {
+    "ollama_base_url": "http://localhost:11434",
+    "llm_model": "qwen2.5:14b",
+  },
+  "answer_generation": {
+    "k_c": 5,
+    "k_p": 3,
+    "k_z": 2,
+    "k_s": 2,
+    "llm_model": "qwen2.5:14b",
+    "ollama_base_url": "http://localhost:11434",
+  },
+  "rerank": {
+    "alpha_sem": 1.0,
+    "beta_struct": 1.0,
+    "top_anchor_p": 8,
+    "max_final_p": 18,
+    "max_chunks_per_p": 3,
+  },
+}
