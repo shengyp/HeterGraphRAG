@@ -1,109 +1,84 @@
+
+
 import logging
-import networkx as nx
 from collections import defaultdict
+from typing import Dict, Iterable, List, Optional
+
+import networkx as nx
 
 logger = logging.getLogger(__name__)
 
-
 class StructuralCentralityRanker:
-    """
-    结构排序（设计 A）：
-    - 在全图上计算结构中心性（k-core + betweenness）
-    - 只对传入的 anchor 节点取分
-    - 按类型分别排序并截断：
-        chunk=6, proposition=6, concept=3, summary=3
-    """
 
-    def __init__(self, cfg=None):
+
+    def __init__(self, cfg: Optional[Dict] = None):
         cfg = cfg or {}
 
-        self.alpha_core = float(cfg.get("alpha_core", 0.5))
-        self.alpha_betw = float(cfg.get("alpha_betw", 0.5))
-        self.gamma_sem = float(cfg.get("gamma_sem", 0.0))
+        self.gamma_sem = float(cfg.get("gamma_sem", 0.5))
 
-        self.k_chunk = int(cfg.get("k_chunk", 6))
-        self.k_prop = int(cfg.get("k_prop", 6))
-        self.k_concept = int(cfg.get("k_concept", 3))
-        self.k_summary = int(cfg.get("k_summary", 3))
+        self.struct_attr = str(cfg.get("struct_attr", "s_struct_global"))
 
-        self.allowed_types = ["chunk", "proposition", "concept", "summary"]
+
+        self.k_prop = int(cfg.get("k_prop", 12))
+        self.k_ent = int(cfg.get("k_ent", 12))
 
         logger.info(
-            "StructuralCentralityRanker init: "
-            "kC=%d kP=%d kZ=%d kS=%d",
-            self.k_chunk, self.k_prop, self.k_concept, self.k_summary
+            "StructuralCentralityRanker init | kP=%d kE=%d gamma_sem=%.3f struct_attr=%s",
+            self.k_prop,
+            self.k_ent,
+            self.gamma_sem,
+            self.struct_attr,
         )
 
-    def _compute_structural_scores(self, graph: nx.Graph):
-        """
-        在整个图上计算每个节点的结构分
-        """
-        scores = {}
+    def _get_struct_score(self, graph: nx.Graph, node_id: str) -> float:
 
-        if graph.number_of_nodes() == 0:
-            return scores
+        if node_id not in graph:
+            raise KeyError(f"节点不在图里: {node_id}")
 
-        g = graph.to_undirected()
-
-        core_num = nx.core_number(g)
-        betw = nx.betweenness_centrality(g)
-
-        # -------- core 归一化 --------
-        max_core = 0
-        for v in core_num.values():
-            if v > max_core:
-                max_core = v
-        if max_core == 0:
-            max_core = 1
-
-        # -------- betweenness 归一化 --------
-        max_betw = 0.0
-        for v in betw.values():
-            if v > max_betw:
-                max_betw = v
-        if max_betw == 0.0:
-            max_betw = 1.0
-
-        # -------- 合成结构分 --------
-        for node in g.nodes():
-            core_score = core_num.get(node, 0) / max_core
-            betw_score = betw.get(node, 0.0) / max_betw
-            scores[node] = (
-                self.alpha_core * core_score
-                + self.alpha_betw * betw_score
+        if self.struct_attr not in graph.nodes[node_id]:
+            raise KeyError(
+                f"Missing '{self.struct_attr}' on node={node_id}. "
+                "请先在离线阶段预计算并写入。"
             )
 
-        return scores
+        val = graph.nodes[node_id][self.struct_attr]
+        if not isinstance(val, (int, float)):
+            raise TypeError(
+                f"'{self.struct_attr}' 必须是数字"
+            )
+        return float(val)
 
-    def rank_anchor_nodes(self, graph: nx.Graph, anchors, s_sem=None):
-        """
-        输入：
-            anchors: 语义锚点（来自子图）
-            s_sem: {node_id: semantic_score}
-        输出：
-            {
-              "chunk": [...],
-              "proposition": [...],
-              "concept": [...],
-              "summary": [...]
-            }
-        """
-        result = {
-            "chunk": [],
-            "proposition": [],
-            "concept": [],
-            "summary": [],
-        }
+
+    def get_struct_scores(self, graph: nx.Graph, nodes: Iterable[str]) -> Dict[str, float]:
+
+        out: Dict[str, float] = {}
+        for nid in nodes:
+            if nid not in graph:
+                continue
+
+            ntype = graph.nodes[nid].get("node_type")
+            if ntype not in ("proposition", "entity"):
+                continue
+
+            out[nid] = self._get_struct_score(graph, nid)
+        return out
+
+    #对输入的 anchor 节点进行打分和排序，分别选出 top-k proposition 和 entity 节点。
+    def rank_anchor_nodes(
+        self,
+        graph: nx.Graph,
+        anchors: Iterable[str],
+        s_sem: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, List[str]]:
+
+        result = {"proposition": [],
+                  "entity": [], "chunk": [], "type": []}
 
         if not anchors:
             return result
 
-        if s_sem is None:
-            s_sem = {}
-
-        struct_scores = self._compute_structural_scores(graph)
-
-        # 1) 给 anchor 打总分
+        s_sem = s_sem or {}
+        #用来按节点类型存放 (node_id, score)
         buckets = defaultdict(list)
 
         for node_id in anchors:
@@ -111,32 +86,35 @@ class StructuralCentralityRanker:
                 continue
 
             node_type = graph.nodes[node_id].get("node_type")
-            if node_type not in self.allowed_types:
+            
+            if node_type not in ("proposition", "entity"):
                 continue
 
-            score = struct_scores.get(node_id, 0.0)
+            score = self._get_struct_score(graph, node_id)
+
 
             if self.gamma_sem != 0.0:
-                score += self.gamma_sem * s_sem.get(node_id, 0.0)
+                if node_id not in s_sem:
+                    raise KeyError(
+                        f"{node_id没有语义分}. "
+
+                    )
+                score += self.gamma_sem * float(s_sem[node_id])
 
             buckets[node_type].append((node_id, score))
 
-        # 2) 每类排序
-        for node_type in buckets:
-            buckets[node_type].sort(key=lambda x: x[1], reverse=True)
 
-        # 3) 每类截断
-        result["chunk"] = [n for n, _ in buckets.get("chunk", [])[: self.k_chunk]]
-        result["proposition"] = [n for n, _ in buckets.get("proposition", [])[: self.k_prop]]
-        result["concept"] = [n for n, _ in buckets.get("concept", [])[: self.k_concept]]
-        result["summary"] = [n for n, _ in buckets.get("summary", [])[: self.k_summary]]
+        if buckets.get("proposition"):
+            #按分数降序排序
+            buckets["proposition"].sort(key=lambda x: x[1], reverse=True)
+            #取前 k_prop 个，只保留节点 id
+            result["proposition"] = [n for n, _ in buckets["proposition"][: self.k_prop]]
 
-        logger.info(
-            "Structural anchors selected: C=%d P=%d Z=%d S=%d",
-            len(result["chunk"]),
-            len(result["proposition"]),
-            len(result["concept"]),
-            len(result["summary"]),
-        )
+        if buckets.get("entity"):
+            # 按分数降序排序
+            buckets["entity"].sort(key=lambda x: x[1], reverse=True)
+            #同理
+            result["entity"] = [n for n, _ in buckets["entity"][: self.k_ent]]
 
+        logger.info("Structural anchors 选择了 | P=%d E=%d", len(result["proposition"]), len(result["entity"]))
         return result

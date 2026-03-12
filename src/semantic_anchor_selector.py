@@ -1,121 +1,89 @@
-"""
-LLM语义锚点选择模块
 
-打分：
-s_total = s_llm
-
-"""
 
 import logging
 import re
+from typing import Any, Dict, Optional
+
 import requests
 
 logger = logging.getLogger(__name__)
 
 
 class SemanticAnchorSelector:
-
-
-    def __init__(self, config):
-        cfg = config or {}
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        cfg = config
         self.config = cfg
-        self.ollama_base_url = cfg.get("ollama_base_url", "http://localhost:11434")
-        self.llm_model = cfg.get("llm_model", "qwen2.5:14b")
+        self.ollama_base_url = str(cfg.get("ollama_base_url", "http://localhost:11434")).rstrip("/")
+        self.llm_model = str(cfg.get("llm_model", "qwen2.5:14b"))
+        self.timeout = int(cfg.get("llm_score_timeout", 20))
+        self.max_prop_len = int(cfg.get("max_node_text_len", 420))
+        logger.info("SemanticAnchorSelector init | model=%s", self.llm_model)
 
+    @staticmethod
+    def _sem_hint(sem: str) -> str:
+        sem = sem.strip().upper()
+        if sem == "HUM":
+            return "Hint: Prefer facts about people, actors, authors, or a specific person."
+        if sem == "LOC":
+            return "Hint: Prefer facts about locations, cities, countries, where something is located, or birthplace."
+        return "Hint: No type bias."
 
-        self.tau_sem = float(cfg.get("tau_sem", 0.25))
-        self.top_k_fallback = int(cfg.get("top_k_fallback", 5))
-
-        self.llm_score_timeout = int(cfg.get("llm_score_timeout", 20))
-
-        logger.info(
-            "SemanticAnchorSelector initialized: llm_model=%s, llm_score_timeout=%ds",
-            self.llm_model,
-            self.llm_score_timeout,
-        )
-
-    def llm_score_node_as_anchor(self, query, intent_type, node_type, node_text):
-      
-        node_text = (node_text or "")[:450]
+    def _score_one(self, query: str, topo: str, sem: str, prop_text: str) -> float:
+        prop_text = (prop_text or "")[: self.max_prop_len]
+        hint = self._sem_hint(sem)
 
         prompt = f"""# Role
-You are a strict relevance rater for retrieval-augmented question answering.
+        You are a "semantic anchor scorer" in multi-hop question answering retrieval.
 
-# Task
-Given a Query and one Node, output ONE float in [0.0, 1.0] indicating how useful this node would be for answering the query.
-This is a CONTINUOUS score (any value like 0.13, 0.67, 0.92 is valid), not a small set of fixed choices.
-Score meaning: "Would I directly cite or strongly rely on this node when answering?"
+        # Task
+        Given a question and a proposition, please evaluate the value of this proposition as a "semantic anchor" and output a score in the range [0,1].
 
-# Output Format (STRICT)
-- Output ONLY a single number (e.g., 0.73)
-- No extra words, no JSON, no punctuation.
-- Keep 2 decimal places when possible.
+        Here, "semantic anchor value" refers to whether the proposition can significantly help retrieval and reasoning in multi-hop question answering, including but not limited to:
+        - directly supporting the final answer
+        - providing a key intermediate entity
+        - connecting adjacent steps in the reasoning chain
+        - narrowing the subsequent search space
+        - providing key attributes for parallel comparison or alignment
 
-# Scoring Rubric (continuous ranges + examples)
+        A high score should be assigned not only to "direct answer propositions," but also to "key bridge propositions."
 
-## [0.90, 1.00] Direct answer / decisive evidence
-Example A
-Query: "What port does SkyWalking OAP use by default?"
-Node: "The OAP server listens on 12800 (HTTP) and 11800 (gRPC)."
-Output: 0.96
+        {hint}
 
-Example B
-Query: "Who developed the theory of relativity?"
-Node: "Albert Einstein developed the theory of relativity in 1905."
-Output: 0.97
+        # Topology Guidance
+        - If the question topology is Sequential: prioritize propositions that can introduce the next-hop intermediate entity or connect earlier and later reasoning steps.
+        - If the question topology is Parallel: prioritize propositions that can support comparison, alignment, intersection, or aggregation across multiple branches.
 
-## [0.70, 0.89] Strongly supportive, key details, close to answering
-Example A
-Query: "What port does SkyWalking OAP use by default?"
-Node: "Configuration examples often use http://127.0.0.1:12800 as the OAP endpoint."
-Output: 0.82
+        # Semantic Guidance
+        - HUM: prioritize information related to people, actors, authors, identities, and person attributes.
+        - LOC: prioritize information related to places, cities, countries, geographic affiliation, birthplace, and where something is located.
+        - OTHER: apply no additional type bias.
 
-Example B
-Query: "Why did the service time out?"
-Node: "Logs show timeouts happen under high concurrency due to downstream latency spikes."
-Output: 0.79
+        # Scoring Criteria
+        - 0.80 - 1.00: the proposition is very important for answering the question; it either directly supports the answer or is an indispensable bridge fact.
+        - 0.50 - 0.79: the proposition is clearly relevant to the question and provides some help, but it is not a core bridge or direct evidence.
+        - 0.20 - 0.49: the proposition provides only weakly relevant background information and has limited usefulness.
+        - 0.00 - 0.19: the proposition is basically irrelevant to the question, or although it is topically related, it provides no substantial help to the reasoning chain.
 
-## [0.40, 0.69] Useful context, partially relevant, but not sufficient alone
-Example A
-Query: "What port does SkyWalking OAP use by default?"
-Node: "OAP is the backend that receives traces and metrics from agents."
-Output: 0.55
+        # Examples (HotpotQA style)
+        Question: "what is one of the stars of The Newcomers known for"
+        Proposition: "The Newcomers starred Chris Evans."
+        Output: 0.88
 
-Example B
-Query: "What is circuit breaker?"
-Node: "A circuit breaker is a resilience pattern often used with fallbacks and timeouts."
-Output: 0.62
+        Question: "what is one of the stars of The Newcomers known for"
+        Proposition: "Chris Evans is known for his superhero roles as the Marvel Comics character Captain America."
+        Output: 0.95
 
-## [0.10, 0.39] Weakly related, tangential, unlikely to be cited
-Example A
-Query: "What port does SkyWalking OAP use by default?"
-Node: "SkyWalking UI is a web dashboard for observability."
-Output: 0.22
+        Question: "what is one of the stars of The Newcomers known for"
+        Proposition: "The Newcomers was filmed in Vermont." 
+        Output: 0.12
 
-Example B
-Query: "Compare BFS and DFS."
-Node: "Graph traversal is used in search problems."
-Output: 0.30
+        # Input
+        Question: {query}
+        Topology: {topo}
+        Semantic: {sem}
+        Proposition: {prop_text}
 
-## [0.00, 0.09] Not relevant
-Example A
-Query: "What port does SkyWalking OAP use by default?"
-Node: "RabbitMQ is a message broker."
-Output: 0.01
-
-Example B
-Query: "What is the time complexity of Dijkstra?"
-Node: "Paris is the capital of France."
-Output: 0.00
-
-# Your Input
-Query: {query}
-Intent: {intent_type}
-Node Type: {node_type}
-Node Content:
-{node_text}
-
-Score (single number only):"""
+        Score:"""
 
         resp = requests.post(
             f"{self.ollama_base_url}/api/generate",
@@ -125,40 +93,28 @@ Score (single number only):"""
                 "stream": False,
                 "options": {"num_predict": 8, "temperature": 0.0},
             },
-            timeout=self.llm_score_timeout,
+            timeout=self.timeout,
         )
         resp.raise_for_status()
 
-        out = (resp.json().get("response") or "").strip()
-
-
+        out = (resp.json().get("response")).strip()
         if not re.fullmatch(r"(?:0(?:\.\d+)?|1(?:\.0+)?)", out):
             raise ValueError(f"LLM score parse failed. raw='{out[:120]}'")
-
         v = float(out)
         if v < 0.0 or v > 1.0:
             raise ValueError(f"LLM score out of range: {v}")
-
         return v
 
-    def select_semantic_anchors(self, graph, query, h_intent, intent_type):
-     
-        n = graph.number_of_nodes()
-        logger.info("开始全量LLM锚点评分：nodes=%d intent_type=%s", n, intent_type)
+    def select_semantic_anchors(self, graph, query: str, intent_topo: str, intent_sem: str) -> Dict[str, Any]:
+        scored = 0
+        s_scores: Dict[str, float] = {}
 
-        s_scores = {}
-        for i, (node_id, node_data) in enumerate(graph.nodes(data=True), start=1):
-            if i % 10 == 0:
-                logger.info("评分进度：%d/%d", i, n)
+        for node_id, node_data in graph.nodes(data=True):
+            if node_data.get("node_type") != "proposition":
+                continue
+            prop_text = node_data.get("text")
+            s_scores[node_id] = float(self._score_one(query, intent_topo, intent_sem, prop_text))
+            scored += 1
 
-            node_type = node_data.get("node_type", "unknown")
-            node_text = node_data.get("text", "")
-
-            s_llm = self.llm_score_node_as_anchor(query, intent_type, node_type, node_text)
-            s_scores[node_id] = float(s_llm)
-
-            if i <= 5:
-                logger.info("node=%s type=%s llm=%.3f", str(node_id)[:30], node_type, s_llm)
-
-        logger.info("LLM打分完成：scored_nodes=%d", len(s_scores))
-        return s_scores
+        logger.info("Semantic scoring done: scored=%d", scored)
+        return {"scores": s_scores, "metadata": {"scored": scored}}
