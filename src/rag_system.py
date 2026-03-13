@@ -20,7 +20,7 @@ class RAGSystem:
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.global_graph: nx.DiGraph
+        self.global_graph: Optional[nx.DiGraph] = None
 
         self.bgem3_retriever = BGEM3Retriever(self.config["coarse_retrieval"])
         self.graph_builder = GraphBuilder(self.config["graph_construction"])
@@ -30,20 +30,20 @@ class RAGSystem:
         self.centrality_ranker = StructuralCentralityRanker(self.config["structural_centrality"])
         self.answer_generator = AnswerGenerator(self.config["answer_generation"])
 
-        rerank_cfg = self.config["rerank"]
-        self.alpha_sem = float(rerank_cfg["alpha_sem"])
-        self.beta_struct = float(rerank_cfg["beta_struct"])
+        rerank_cfg = self.config.get("rerank", {}) or {}
+        self.top_anchor_p = int(rerank_cfg.get("top_anchor_p", 8))
+        self.top_entity_expand = int(rerank_cfg.get("top_entity_expand", 6))
+        self.max_final_p = int(rerank_cfg.get("max_final_p", 18))
+        self.max_chunks_per_p = int(rerank_cfg.get("max_chunks_per_p", 3))
 
-        # 语义锚点（top-k propositions）
-        self.top_anchor_p = int(rerank_cfg["top_anchor_p"])
-        # 扩展后最多保留多少 P
-        self.max_final_p = int(rerank_cfg["max_final_p"])
-        self.max_chunks_per_p = int(rerank_cfg["max_chunks_per_p"])
+        # 扩展分数传播参数
+        self.expand_decay = float(rerank_cfg.get("expand_decay", 0.8))
+        self.expand_struct_mix = float(rerank_cfg.get("expand_struct_mix", 0.3))
 
         logger.info(
-            "RAGSystem ready | α=%.2f β=%.2f top_anchor_p=%d max_final_p=%d",
-            self.alpha_sem,
-            self.beta_struct,
+            "RAGSystem ready | gamma_sem=%.2f beta_struct=%.2f top_anchor_p=%d max_final_p=%d",
+            self.centrality_ranker.gamma_sem,
+            self.centrality_ranker.beta_struct,
             self.top_anchor_p,
             self.max_final_p,
         )
@@ -90,6 +90,8 @@ class RAGSystem:
         if not query:
             raise ValueError("query 为空")
 
+        if self.global_graph is None:
+            raise RuntimeError("global_graph 尚未构建")
         # 5.2（前置）：只用 query 做意图识别
         _, intent_topo, intent_sem = self.intent_repr.predict_intent(query)
 
@@ -130,7 +132,36 @@ class RAGSystem:
         expanded_props = self._intent_controlled_expand(anchor_props, intent_sem)
 
         # 最终 P 集合：锚点 + 扩展
-        final_props = list(dict.fromkeys(anchor_props + expanded_props))[: self.max_final_p]
+        # 合并 anchor + expanded，并去重
+        merged_props = list(dict.fromkeys(anchor_props + expanded_props))
+
+        # 按 query-time final score 统一重排
+        merged_props.sort(
+            key=lambda pid: float(self.global_graph.nodes[pid].get("s_final_q", 0.0)),
+            reverse=True,
+        )
+
+        # 截断
+        final_props = merged_props[: self.max_final_p]
+
+        logger.info(
+            "Final proposition merge done: anchors=%d expanded=%d merged=%d kept=%d",
+            len(anchor_props),
+            len(expanded_props),
+            len(merged_props),
+            len(final_props),
+        )
+        for rank, pid in enumerate(final_props[:10], start=1):
+            ptxt = str(self.global_graph.nodes[pid].get("text", ""))[:120].replace("\n", " ")
+            logger.info(
+                "[FinalMergedProp %02d] pid=%s | s_final_q=%.4f | s_struct_q=%.4f | s_sem_q=%.4f | text=%s",
+                rank,
+                pid,
+                float(self.global_graph.nodes[pid].get("s_final_q", 0.0)),
+                float(self.global_graph.nodes[pid].get("s_struct_q", 0.0)),
+                float(self.global_graph.nodes[pid].get("s_sem_q", 0.0)),
+                ptxt,
+            )
 
         # 5.7 证据聚合：P -> C，E -> Z 用于消歧
         buckets = self._build_evidence_buckets(final_props)
@@ -158,8 +189,8 @@ class RAGSystem:
             "num_q_edges": G_q.number_of_edges(),
             "num_anchor_props": len(anchor_props),
             "num_final_props": len(final_props),
-            "alpha_sem": self.alpha_sem,
-            "beta_struct": self.beta_struct,
+            "gamma_sem": self.centrality_ranker.gamma_sem,
+            "beta_struct": self.centrality_ranker.beta_struct,
         }
         return result
 
@@ -239,31 +270,62 @@ class RAGSystem:
     # 5.5 Anchor selection
     # =========================
     def _select_anchor_props(self, G_q: nx.DiGraph, s_sem: Dict[str, float]) -> List[str]:
-        prop_candidates = [n for n, d in G_q.nodes(data=True) if d.get("node_type") == "proposition"]
+        """
+        从查询子图中选择 anchor propositions。
+        现在排序逻辑统一委托给 StructuralCentralityRanker。
+        """
+        prop_candidates = [
+            n for n, d in G_q.nodes(data=True)
+            if d.get("node_type") == "proposition"
+        ]
         if not prop_candidates:
-            raise RuntimeError("查询子图中没有 proposition")
+            raise RuntimeError("查询子图中没有 proposition 节点，无法选择 anchor")
 
-        scored: List[Tuple[str, float]] = []
+        ranked = self.centrality_ranker.rank_anchor_nodes(
+            self.global_graph,
+            prop_candidates=prop_candidates,
+            ent_candidates=None,
+            s_sem=s_sem,
+        )
+
+        ranked_props = ranked["proposition"]
+
+        if not ranked_props:
+            raise RuntimeError("StructuralCentralityRanker 未返回任何 proposition 排序结果")
+
+
+        for pid, final_score, struct_score, sem_score in ranked_props:
+            self.global_graph.nodes[pid]["s_final_q"] = float(final_score)
+            self.global_graph.nodes[pid]["s_struct_q"] = float(struct_score)
+            self.global_graph.nodes[pid]["s_sem_q"] = float(sem_score)
+
+        ranked_map = {
+            pid: (final_score, struct_score, sem_score)
+            for pid, final_score, struct_score, sem_score in ranked_props
+        }
         for pid in prop_candidates:
-            if pid not in s_sem:
-                continue
-            nd = self.global_graph.nodes.get(pid) or {}
-            if "s_struct_global" not in nd:
-                raise KeyError(f"Missing s_struct_global on proposition={pid}（请先离线写入）")
+            if pid not in ranked_map:
+                struct_score = float(self.global_graph.nodes[pid].get("s_struct_global", 0.0))
+                sem_score = float(s_sem.get(pid, 0.0))
+                final_score = (
+                        self.centrality_ranker.beta_struct * struct_score
+                        + self.centrality_ranker.gamma_sem * sem_score
+                )
+                self.global_graph.nodes[pid]["s_final_q"] = float(final_score)
+                self.global_graph.nodes[pid]["s_struct_q"] = float(struct_score)
+                self.global_graph.nodes[pid]["s_sem_q"] = float(sem_score)
 
-            sem = float(s_sem[pid])
-            st = float(nd["s_struct_global"])
-            sc = self.alpha_sem * sem + self.beta_struct * st
-            scored.append((pid, sc))
+        anchor_props = [pid for pid, _, _, _ in ranked_props[: self.top_anchor_p]]
 
-        scored.sort(key=lambda x: x[1], reverse=True)
+        logger.info(
+            "Anchor propositions selected by StructuralCentralityRanker: total_candidates=%d, returned=%d, top_anchor=%d",
+            len(prop_candidates),
+            len(ranked_props),
+            len(anchor_props),
+        )
+        return anchor_props
 
-        # 回写
-        for pid, sc in scored:
-            self.global_graph.nodes[pid]["s_final_q"] = float(sc)
-            self.global_graph.nodes[pid]["s_sem_q"] = float(s_sem.get(pid, 0.0))
 
-        return [pid for pid, _ in scored[: self.top_anchor_p]]
 
     # =========================
     # 5.6 Intent-controlled P-E-P expansion
@@ -288,33 +350,183 @@ class RAGSystem:
                 return True
         return False
 
-    def _intent_controlled_expand(self, anchor_props: List[str], intent_sem: str) -> List[str]:
-        expanded: Set[str] = set()
+    def _collect_and_rerank_expand_entities(
+            self,
+            anchor_props: List[str],
+            intent_sem: str,
+    ) -> Tuple[List[str], Dict[str, List[str]], Dict[str, float]]:
+        """
+        从 anchor propositions 收集候选 entity：
+        1) 先按 intent_sem 做类型过滤
+        2) 再用 StructuralCentralityRanker 做 entity rerank
+        3) 返回:
+           - top_entity_ids: 最终用于扩展的 entity
+           - ent2anchors: 每个 entity 是由哪些 anchor propositions 连接到的
+           - ent_score_map: entity 的 query-time rerank 分数
+        """
+        candidate_entities: Set[str] = set()
+        ent2anchors: Dict[str, List[str]] = {}
 
         for pid in anchor_props:
             if not self.global_graph.has_node(pid):
                 continue
 
-            # P -> E
-            eids: List[str] = []
             for nb in self.global_graph.successors(pid):
                 ed = self.global_graph.get_edge_data(pid, nb) or {}
-                if ed.get("edge_type") == "ASSERTS" and self.global_graph.nodes[nb].get("node_type") == "entity":
-                    if self._entity_matches_sem(nb, intent_sem):
-                        eids.append(nb)
+                if ed.get("edge_type") != "ASSERTS":
+                    continue
+                if self.global_graph.nodes[nb].get("node_type") != "entity":
+                    continue
+                if not self._entity_matches_sem(nb, intent_sem):
+                    continue
 
-            # E -> P
-            for eid in eids:
-                for nb in self.global_graph.successors(eid):
-                    ed = self.global_graph.get_edge_data(eid, nb) or {}
-                    if ed.get("edge_type") == "INVOLVED_IN" and self.global_graph.nodes[nb].get("node_type") == "proposition":
-                        expanded.add(nb)
+                candidate_entities.add(nb)
+                ent2anchors.setdefault(nb, []).append(pid)
 
-        # 不把 anchors 自己重复加回去
+        if not candidate_entities:
+            return [], {}, {}
+
+        ranked_entities = self.centrality_ranker.rank_entities(
+            self.global_graph,
+            ent_candidates=list(candidate_entities),
+            s_sem=None,
+        )
+        # ranked_entities: [(eid, final_score, struct_score, sem_score), ...]
+
+        top_ranked = ranked_entities[: self.top_entity_expand]
+        top_entity_ids = [eid for eid, _, _, _ in top_ranked]
+
+        ent_score_map: Dict[str, float] = {}
+        for eid, final_score, struct_score, sem_score in top_ranked:
+            ent_score_map[eid] = float(final_score)
+            # 也顺手写回图，后面调试好看
+            self.global_graph.nodes[eid]["s_ent_q"] = float(final_score)
+            self.global_graph.nodes[eid]["s_ent_struct_q"] = float(struct_score)
+            self.global_graph.nodes[eid]["s_ent_sem_q"] = float(sem_score)
+
+        logger.info(
+            "Expand-entity rerank done: candidates=%d selected=%d",
+            len(candidate_entities),
+            len(top_entity_ids),
+        )
+        for rank, (eid, final_score, struct_score, sem_score) in enumerate(top_ranked, start=1):
+            etxt = str(self.global_graph.nodes[eid].get("text", ""))[:100].replace("\n", " ")
+            logger.info(
+                "[ExpandEntity %02d] eid=%s | final=%.4f | struct=%.4f | sem=%.4f | text=%s",
+                rank, eid, final_score, struct_score, sem_score, etxt
+            )
+
+        return top_entity_ids, ent2anchors, ent_score_map
+
+    def _backfill_expanded_prop_scores_by_decay(
+            self,
+            prop2sources: Dict[str, List[Tuple[str, str]]],
+            ent_score_map: Dict[str, float],
+    ) -> None:
+        """
+        给新扩展出来的 proposition 补 query-time 分数。
+
+        逻辑：
+        1) 新 proposition 的上游来源是 (anchor_pid, eid)
+        2) 先从所有来源里取最强 anchor 分数
+        3) 传播分 = expand_decay * best_anchor_score
+        4) 最终分 = expand_struct_mix * struct_score + (1 - expand_struct_mix) * 传播分
+
+        这里只给“还没有 s_final_q”的 proposition 补分；
+        已经在 anchor 选择阶段打过分的 proposition 不覆盖。
+        """
+        for pid, srcs in prop2sources.items():
+            if not self.global_graph.has_node(pid):
+                continue
+
+            nd = self.global_graph.nodes[pid]
+            if nd.get("node_type") != "proposition":
+                continue
+
+            # 已经有 query-time 分数的不覆盖
+            if "s_final_q" in nd:
+                continue
+
+            if not srcs:
+                continue
+
+            upstream_anchor_scores: List[float] = []
+            for anchor_pid, eid in srcs:
+                anchor_score = float(self.global_graph.nodes[anchor_pid].get("s_final_q", 0.0))
+                upstream_anchor_scores.append(anchor_score)
+
+            best_anchor_score = max(upstream_anchor_scores) if upstream_anchor_scores else 0.0
+            propagated_score = self.expand_decay * best_anchor_score
+
+            struct_score = float(nd.get(self.centrality_ranker.struct_attr, 0.0))
+            final_score = (
+                    self.expand_struct_mix * struct_score
+                    + (1.0 - self.expand_struct_mix) * propagated_score
+            )
+
+            nd["s_struct_q"] = float(struct_score)
+            nd["s_sem_q"] = float(propagated_score)  # 这里把“传播相关性”记到 s_sem_q，便于统一看日志
+            nd["s_final_q"] = float(final_score)
+
+            logger.info(
+                "[BackfillExpandedProp] pid=%s | struct=%.4f | propagated=%.4f | final=%.4f",
+                pid, struct_score, propagated_score, final_score
+            )
+
+    def _intent_controlled_expand(self, anchor_props: List[str], intent_sem: str) -> List[str]:
+        expanded: Set[str] = set()
+
+        # 1) 收集并 rerank entity
+        top_entity_ids, ent2anchors, ent_score_map = self._collect_and_rerank_expand_entities(
+            anchor_props, intent_sem
+        )
+
+        # 2) 从 top entities 往外扩 proposition，并记录来源
+        prop2sources: Dict[str, List[Tuple[str, str]]] = {}
+
+        for eid in top_entity_ids:
+            anchor_list = ent2anchors.get(eid, [])
+            for nb in self.global_graph.successors(eid):
+                ed = self.global_graph.get_edge_data(eid, nb) or {}
+                if ed.get("edge_type") != "INVOLVED_IN":
+                    continue
+                if self.global_graph.nodes[nb].get("node_type") != "proposition":
+                    continue
+
+                expanded.add(nb)
+                for anchor_pid in anchor_list:
+                    prop2sources.setdefault(nb, []).append((anchor_pid, eid))
+
+        # 3) 不把 anchors 自己重复加回去
         expanded_list = [p for p in expanded if p not in set(anchor_props)]
 
-        # 按 s_final_q 排一把（没有就 0）
-        expanded_list.sort(key=lambda x: float(self.global_graph.nodes[x].get("s_final_q", 0.0)), reverse=True)
+        # 4) 给新扩展 proposition 补 query-time 分数（衰减传播版）
+        self._backfill_expanded_prop_scores_by_decay(prop2sources, ent_score_map)
+
+        # 5) 再按 s_final_q 排序
+        expanded_list.sort(
+            key=lambda x: float(self.global_graph.nodes[x].get("s_final_q", 0.0)),
+            reverse=True
+        )
+
+        logger.info(
+            "Intent-controlled expansion done: anchors=%d top_entities=%d expanded_props=%d",
+            len(anchor_props),
+            len(top_entity_ids),
+            len(expanded_list),
+        )
+        for rank, pid in enumerate(expanded_list[:10], start=1):
+            ptxt = str(self.global_graph.nodes[pid].get("text", ""))[:120].replace("\n", " ")
+            logger.info(
+                "[ExpandedProp %02d] pid=%s | s_final_q=%.4f | s_struct_q=%.4f | s_sem_q=%.4f | text=%s",
+                rank,
+                pid,
+                float(self.global_graph.nodes[pid].get("s_final_q", 0.0)),
+                float(self.global_graph.nodes[pid].get("s_struct_q", 0.0)),
+                float(self.global_graph.nodes[pid].get("s_sem_q", 0.0)),
+                ptxt,
+            )
+
         return expanded_list
 
     # =========================
@@ -336,13 +548,33 @@ class RAGSystem:
             pscore = float(pnd.get("s_final_q", 0.0))
 
             # P -> C
-            support_chunks: List[str] = []
+            support_chunks = []
             for nb in self.global_graph.successors(pid):
                 ed = self.global_graph.get_edge_data(pid, nb) or {}
                 if ed.get("edge_type") == "SUPPORTED_BY":
                     support_chunks.append(nb)
-            support_chunks = support_chunks[: self.max_chunks_per_p]
 
+            # 先为每个 support chunk 计算一个 chunk_score：
+            # 定义为“所有支持到该 chunk 的 proposition 中，最大的 s_final_q”
+            chunk_scored = []
+            for cid in support_chunks:
+                cscore = 0.0
+
+                # 找所有指向这个 chunk 的 proposition
+                for pred in self.global_graph.predecessors(cid):
+                    if self.global_graph.nodes[pred].get("node_type") != "proposition":
+                        continue
+                    ed2 = self.global_graph.get_edge_data(pred, cid) or {}
+                    if ed2.get("edge_type") != "SUPPORTED_BY":
+                        continue
+                    pscosre = float(self.global_graph.nodes[pred].get("s_final_q", 0.0))
+                    cscore = max(cscore, pscore)
+
+                chunk_scored.append((cid, cscore))
+
+            # 按 chunk_score 降序排序，再截断
+            chunk_scored.sort(key=lambda x: x[1], reverse=True)
+            support_chunks = [cid for cid, _ in chunk_scored[: self.max_chunks_per_p]]
             for cid in support_chunks:
                 if not self.global_graph.has_node(cid):
                     continue
