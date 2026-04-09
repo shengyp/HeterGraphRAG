@@ -21,7 +21,10 @@
 项目总配置文件。定义粗检索、构图、意图识别、语义锚点、答案生成、结构重排等模块参数。
 
 #### `requirements.txt`
-Python 依赖清单。
+Python 依赖清单。现在已经补充了源码真实会用到的关键依赖，适合 `pip install -r requirements.txt`。
+
+#### `environment.yml`
+Conda 环境文件。适合在新机器上快速创建可运行环境。
 
 #### `run_main_hotpot_chunks.py`
 用途：项目统一主入口。
