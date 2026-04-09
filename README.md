@@ -1,5 +1,4 @@
 # HeterGraphRAG
-# 项目检查说明与启动 README
 
 ## 1. 项目概览
 
