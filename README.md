@@ -23,6 +23,24 @@
 #### `requirements.txt`
 Python 依赖清单。
 
+#### `run_main_hotpot_chunks.py`
+用途：项目统一主入口。
+
+输入：
+- `config.yaml`
+- `data/hotpotqa/hotpot_chunks.json`
+- `data/hotpotqa/hotpot_docs.json`
+- 用户指定的 `--num-questions`
+- 可选 `--query`，或 `--use-first-question-query`
+
+输出：
+- `results/run_main_hotpot_chunks_q{N}.json`
+
+特点：
+- 支持只用前 N 个问题对应的 chunk/doc 子集做实验
+- 不需要手动改源码里的路径
+- 兼容当前项目里 `embedding_model / model_name` 的字段差异
+
 #### `eval_intent_coarse_chunk_only.py`
 批量评测脚本。功能是：
 - 用 `RAGSystem` 的前半段能力
@@ -140,23 +158,7 @@ HotpotQA 数据格式转换工具。
 
 这是整个项目的主 orchestrator。
 
-#### `run_main_hotpot_chunks.py`
-用途：项目统一主入口。
 
-输入：
-- `config.yaml`
-- `data/hotpotqa/hotpot_chunks.json`
-- `data/hotpotqa/hotpot_docs.json`
-- 用户指定的 `--num-questions`
-- 可选 `--query`，或 `--use-first-question-query`
-
-输出：
-- `results/run_main_hotpot_chunks_q{N}.json`
-
-特点：
-- 支持只用前 N 个问题对应的 chunk/doc 子集做实验
-- 不需要手动改源码里的路径
-- 兼容当前项目里 `embedding_model / model_name` 的字段差异
 
 #### `src/run_coarse_single.py`
 粗检索单样例测试脚本。
