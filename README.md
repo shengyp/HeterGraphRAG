@@ -300,11 +300,45 @@ python "graph_build_experiment (1).py" \
 --mode debug
 ```
 
-### 第七步：单样例粗检索测试
+## 6. 整体启动方式
 
-`src/run_coarse_single.py` 的用途是单测粗检索。
+### 6.1 统一主入口
 
-但是它当前默认路径不对，所以按现状需要你先改里面的路径，或者自行重写一个更通用的单测脚本再运行。
+现在最推荐的启动方式是直接运行：
+
+```bash
+python run_main_hotpot_chunks.py --num-questions 5 --query "Which film starred both Chris Evans and Kate Bosworth?"
+```
+
+这个脚本会自动完成：
+
+1. 读取 `config.yaml`
+2. 从 `hotpot_chunks.json` 中选择前 `N` 个问题对应的 `qa_id`
+3. 过滤出这 `N` 个问题对应的 chunk/doc 子集
+4. 构建或加载 coarse retrieval index
+5. 构建或加载 global graph
+6. 调用 `RAGSystem.query()` 跑完整流程
+7. 将结果输出到 `results/run_main_hotpot_chunks_q{N}.json`
+
+### 6.2 不手写 query，直接用第一个问题
+
+```bash
+python run_main_hotpot_chunks.py --num-questions 5 --use-first-question-query
+```
+
+### 6.3 强制重建 index 和 graph
+
+```bash
+python run_main_hotpot_chunks.py --num-questions 5 --use-first-question-query --rebuild-index --rebuild-graph
+```
+
+### 6.4 常用参数说明
+
+- `--num-questions`：只取前多少个问题对应的 chunk/doc 子集
+- `--query`：手动指定问题
+- `--use-first-question-query`：不手动传 query，直接使用这批子集里的第一个问题
+- `--rebuild-index`：强制重建 coarse retrieval 索引
+- `--rebuild-graph`：强制重建 global graph
 
 ---
 
