@@ -1,63 +1,96 @@
-config = {
-  "coarse_retrieval": {
-    "top_k_dense": 100,
-    "top_k_final": 50,
-    "lambda_dense": 1.0,
-    "lambda_sparse": 0.0,
-    "ollama_base_url": "http://localhost:11434",
-    "top_k_final_parallel": 80,   # Parallel 单轮粗检
-    "top_k_final_seq1": 30,       # Sequential 第一轮
-    "top_k_final_seq2": 60,
-  },
-  "graph_construction": {
-    "ollama_base_url": "http://localhost:11434",
-    "llm_model": "qwen2.5:14b",
-    "hf_tokenizer_name": "BAAI/bge-m3",
-    "max_tokens_per_chunk": 300,
-    "dedup_by_title": True,
+coarse_retrieval:
+  model_name: "BAAI/bge-m3"
+  use_fp16: false
+  batch_size: 8
+  top_k_dense: 100
+  top_k_sparse: 100
+  top_k_final: 10
+  fusion_method: "rrf"
+  rrf_k: 60
+  lambda_dense: 0.5
+  lambda_sparse: 0.5
+  expected_dense_dim: 1024
+  top_k_final_parallel: 80
+  top_k_final_seq1: 30
+  top_k_final_seq2: 60
 
-    "entity_similarity_threshold": 0.8,
-    "proposition_similarity_threshold": 0.7,
-    "concept_similarity_threshold": 0.75,
-    "summary_similarity_threshold": 0.7,
-    "concept_num_clusters": 20,
+graph_construction:
+  ollama_base_url: "http://localhost:11434"
+  llm_model: "qwen2.5:14b"
+  embedding_model: "bge-m3:latest"
+  embedding_dim: 1024
+  entity_type_labels: ["PERSON", "LOCATION", "OTHER"]
+  entity_type_cache_path: "data/entity_type_cache.json"
+  flush_type_cache_each_write: false
+  debug_dir: "debug_logs"
 
-    "recall_top_k": 25,
-    "edge_cosine_threshold": 0.72,
-    "entity_overlap_threshold": 1,
-    "cross_doc_only": True,
-    "max_groups": 8,
-    "max_llm_group_input": 12,
-  },
-  "subgraph": {"hops": 2},
-  "semantic_anchor": {
-    "tau_sem": 0.25,
-    "top_k_fallback": 5,
-    "llm_model": "qwen2.5:14b",
-    "ollama_base_url": "http://localhost:11434",
-  },
-  "structural_centrality": {
-    "alpha_core": 0.5,
-    "alpha_betw": 0.5,
-    "k0": 10,
-  },
-  "intent_representation": {
-    "ollama_base_url": "http://localhost:11434",
-    "llm_model": "qwen2.5:14b",
-  },
-  "answer_generation": {
-    "k_c": 5,
-    "k_p": 3,
-    "k_z": 2,
-    "k_s": 2,
-    "llm_model": "qwen2.5:14b",
-    "ollama_base_url": "http://localhost:11434",
-  },
-  "rerank": {
-    "alpha_sem": 1.0,
-    "beta_struct": 1.0,
-    "top_anchor_p": 8,
-    "max_final_p": 18,
-    "max_chunks_per_p": 3,
-  },
-}
+  hf_tokenizer_name: "BAAI/bge-m3"
+  max_tokens_per_chunk: 300
+  dedup_by_title: true
+
+  entity_similarity_threshold: 0.8
+  proposition_similarity_threshold: 0.7
+  concept_similarity_threshold: 0.75
+  summary_similarity_threshold: 0.7
+  concept_num_clusters: 20
+
+  recall_top_k: 25
+  edge_cosine_threshold: 0.72
+  entity_overlap_threshold: 1
+  cross_doc_only: true
+  max_groups: 8
+  max_llm_group_input: 12
+
+  offline_struct_prior:
+    alpha_core: 0.5
+    alpha_betw: 0.5
+    attr: "s_struct_global"
+
+intent_representation:
+  ollama_base_url: "http://localhost:11434"
+  llm_model: "qwen2.5:14b"
+  timeout: 30
+  max_ctx_snippets: 4
+  max_snippet_len: 260
+
+semantic_anchor:
+  ollama_base_url: "http://localhost:11434"
+  llm_model: "qwen2.5:14b"
+  llm_score_timeout: 30
+  max_node_text_len: 420
+  tau_sem: 0.25
+  top_k_fallback: 5
+
+answer_generation:
+  ollama_base_url: "http://localhost:11434"
+  llm_model: "qwen2.5:14b"
+  k_per_type: 5
+  k_p: 3
+  k_e: 5
+  k_c: 5
+  k_z: 2
+  max_len_prop: 520
+  max_len_chunk: 650
+  max_len_ent: 120
+  max_len_type: 40
+  temperature: 0.2
+  num_predict: 240
+  timeout: 120
+
+rerank:
+  top_anchor_p: 8
+  top_entity_expand: 6
+  max_final_p: 18
+  max_chunks_per_p: 3
+  expand_decay: 0.8
+  expand_struct_mix: 0.3
+
+structural_centrality:
+  gamma_sem: 0.5
+  beta_struct: 1.0
+  struct_attr: "s_struct_global"
+  k_prop: 12
+  k_ent: 12
+
+subgraph:
+  hops: 2
