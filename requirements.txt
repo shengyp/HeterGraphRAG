@@ -1,0 +1,17 @@
+numpy>=1.24,<3
+networkx>=3.0,<4
+requests>=2.31,<3
+tqdm>=4.66,<5
+
+# BGE-M3 hybrid dense+sparse retrieval.
+# If this install pulls a CPU-only torch but you have CUDA, reinstall torch
+# from https://pytorch.org/get-started/locally/ before running large experiments.
+FlagEmbedding>=1.2.11
+
+# Common transitive dependencies used by FlagEmbedding/BGE-M3.
+torch>=2.1
+transformers>=4.40
+sentence-transformers>=2.6
+sentencepiece>=0.1.99
+protobuf>=4.25
+faiss-cpu>=1.7.4

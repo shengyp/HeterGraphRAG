@@ -1,0 +1,838 @@
+# -*- coding: utf-8 -*-
+
+import json
+import logging
+import re
+import hashlib
+import os
+from typing import Dict, List, Tuple, Set
+
+import networkx as nx
+import numpy as np
+import requests
+
+logger = logging.getLogger(__name__)
+
+
+class GraphBuilder:
+    DEFAULT_ENTITY_TYPE_LABELS = [
+        "PERSON",
+        "LOCATION",
+        "ORGANIZATION",
+        "WORK",
+        "EVENT",
+        "TIME",
+        "NUMBER",
+        "CONCEPT",
+        "OTHER",
+    ]
+
+    # 0) 初始化与配置
+    def __init__(self, config: Dict):
+        self.config = config
+
+        required = [
+            "ollama_base_url",
+            "llm_model",
+            "embedding_dim",
+            "entity_type_labels",
+            "entity_type_cache_path",
+        ]
+        missing = [k for k in required if k not in config]
+        if missing:
+            raise ValueError(f"GraphBuilder 配置缺少必填项: {', '.join(missing)}")
+
+        self.ollama_base_url = str(config["ollama_base_url"]).rstrip("/")
+        self.llm_model = str(config["llm_model"])
+        self.embedding_dim = int(config["embedding_dim"])
+        self.embedding_model = str(config.get("embedding_model", "bge-m3:latest"))
+        self.flush_type_cache_each_write = bool(config.get("flush_type_cache_each_write", False))
+        self.strict_methodology = bool(config.get("strict_methodology", False))
+        self.last_type_cache_hit = False
+        self.last_type_cache_label = ""
+
+        labels = config["entity_type_labels"]
+        if not isinstance(labels, list) or not labels:
+            raise ValueError("entity_type_labels 必须是非空 list")
+        label_set = {str(x).strip().upper() for x in labels if str(x).strip()}
+        missing_default_labels = set(self.DEFAULT_ENTITY_TYPE_LABELS) - label_set
+        if self.strict_methodology and missing_default_labels:
+            raise ValueError(
+                "strict_methodology=True requires graph_construction.entity_type_labels "
+                f"to explicitly include: {sorted(missing_default_labels)}"
+            )
+        # Keep old configs usable while adopting the retrieval-oriented entity taxonomy.
+        label_set.update(self.DEFAULT_ENTITY_TYPE_LABELS)
+        self.type_labels: List[str] = sorted(label_set)
+        if not self.type_labels:
+            raise ValueError("entity_type_labels 清洗后为空")
+        self.type_label_set: Set[str] = set(self.type_labels)
+
+        self.type_cache_path = str(config["entity_type_cache_path"])
+        self.type_cache: Dict[str, str] = self._load_type_cache()
+
+        self.debug_dir = str(self.config.get("debug_dir", "/home/featurize/debug_logs"))
+        os.makedirs(self.debug_dir, exist_ok=True)
+
+        logger.info(
+            "GraphBuilder(strict) 初始化完成 | embedding_model=%s dim=%d | labels=%d | cache=%s",
+            self.embedding_model,
+            self.embedding_dim,
+            len(self.type_labels),
+            self.type_cache_path,
+        )
+
+    # 1) 通用工具
+    def _norm_entity(self, s: str) -> str:
+        s = s.strip().lower()
+        s = re.sub(r"\s+", " ", s)
+        return s
+
+    def _entity_node_id(self, entity_text: str) -> str:
+        return f"ent::{self._norm_entity(entity_text)}"
+
+    def _type_node_id(self, type_label: str) -> str:
+        return f"type::{type_label.strip().upper()}"
+
+    def _stable_prop_id(self, prop_text: str) -> str:
+        h = hashlib.sha1(prop_text.encode("utf-8")).hexdigest()[:10]
+        return f"prop::{h}"
+
+    def _write_debug_file(self, filename: str, payload: str) -> None:
+        os.makedirs(self.debug_dir, exist_ok=True)
+        path = os.path.join(self.debug_dir, filename)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(payload)
+            if not payload.endswith("\n"):
+                f.write("\n")
+
+    def _record_bad_embed_input(self, text: str, status: int = -1, body: str = "", stage: str = "unknown") -> None:
+        preview = text[:5000]
+        payload = (
+            "=" * 100 + "\n"
+            f"STAGE: {stage}\n"
+            f"STATUS: {status}\n"
+            f"BODY: {body[:2000]}\n"
+            f"TEXT_LEN: {len(text)}\n"
+            "TEXT_REPR_PREVIEW:\n"
+            f"{repr(preview)}\n"
+            "TEXT_RAW_PREVIEW:\n"
+            f"{preview}\n"
+        )
+        self._write_debug_file("bad_embed_input.txt", payload)
+
+    def _record_bad_llm_output(self, chunk_id: str, raw: str, stage: str = "extract_facts") -> None:
+        payload = (
+            "=" * 100 + "\n"
+            f"STAGE: {stage}\n"
+            f"CHUNK_ID: {chunk_id}\n"
+            "RAW_RESPONSE_PREVIEW:\n"
+            f"{raw[:5000]}\n"
+        )
+        self._write_debug_file("bad_llm_output.txt", payload)
+
+    def _encode_text(self, text: str) -> List[float]:
+        text = text.strip()
+        if not text:
+            raise ValueError("embedding 输入文本为空（严格模式不允许）")
+
+        base = self.ollama_base_url.rstrip("/")
+
+        resp = requests.post(
+            f"{base}/api/embed",
+            json={"model": self.embedding_model, "input": text},
+            timeout=120,
+        )
+
+        if resp.status_code == 404:
+            raise RuntimeError("当前环境下 /api/embed 不存在，请检查 Ollama 版本或服务配置")
+
+        if not resp.ok:
+            body = resp.text[:2000]
+            self._record_bad_embed_input(text=text, status=resp.status_code, body=body, stage="api_embed_http_error")
+            raise RuntimeError(f"新 embedding 接口失败: status={resp.status_code}, body={body}")
+
+        data = resp.json()
+
+        emb = None
+        if isinstance(data.get("embeddings"), list) and len(data["embeddings"]) > 0:
+            emb = data["embeddings"][0]
+        elif isinstance(data.get("embedding"), list):
+            emb = data["embedding"]
+
+        if emb is None:
+            self._record_bad_embed_input(
+                text=text,
+                status=200,
+                body=json.dumps(data, ensure_ascii=False)[:2000],
+                stage="api_embed_missing_field",
+            )
+            raise ValueError(f"/api/embed 未返回 embedding/embeddings 字段: {data}")
+
+        vec = np.asarray(emb, dtype=float).flatten()
+
+        if not np.isfinite(vec).all():
+            self._record_bad_embed_input(
+                text=text,
+                status=200,
+                body="embedding contains NaN/Inf after parsing",
+                stage="api_embed_nan_inf",
+            )
+            raise ValueError("embedding 含 NaN/Inf")
+
+        if vec.shape[0] != self.embedding_dim:
+            self._record_bad_embed_input(
+                text=text,
+                status=200,
+                body=f"bad embedding dim: got={vec.shape[0]} expected={self.embedding_dim}",
+                stage="api_embed_bad_dim",
+            )
+            raise ValueError(f"embedding 维度错误: got={vec.shape[0]} expected={self.embedding_dim}")
+
+        return vec.tolist()
+
+    def _extract_first_json_object(self, raw: str) -> str:
+        if not raw:
+            raise ValueError("LLM 输出为空")
+
+        s = raw.strip()
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s*```$", "", s)
+
+        start = s.find("{")
+        if start < 0:
+            raise ValueError("LLM 输出中找不到 '{'")
+
+        depth = 0
+        in_str = False
+        esc = False
+
+        for i in range(start, len(s)):
+            ch = s[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+
+            if ch == '"':
+                in_str = True
+                continue
+
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start : i + 1]
+
+        raise ValueError("JSON 大括号不平衡，无法抽取完整对象")
+
+    # 2) 类型缓存
+    def _load_type_cache(self) -> Dict[str, str]:
+        try:
+            with open(self.type_cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("type_cache 文件必须是 JSON object")
+
+            out: Dict[str, str] = {}
+            for k, v in data.items():
+                kk = str(k).strip()
+                vv = str(v).strip().upper()
+                if kk and vv:
+                    out[kk] = vv
+            return out
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            raise ValueError(f"加载 type_cache 失败: {e}")
+
+    def _save_type_cache(self) -> None:
+        dirpath = os.path.dirname(self.type_cache_path)
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
+        with open(self.type_cache_path, "w", encoding="utf-8") as f:
+            json.dump(self.type_cache, f, ensure_ascii=False, indent=2)
+
+    # 3) Step 1: chunk -> facts & entities
+    def extract_facts_and_entities_from_chunk(self, chunk: Dict) -> Tuple[List[Dict], List[str]]:
+        cid = chunk.get("id")
+        text = chunk.get("text")
+        if not (isinstance(text, str) and text.strip()):
+            raise ValueError(f"chunk 文本为空: chunk_id={cid}")
+
+        output_schema = """{
+  "entities": ["Entity 1", "Entity 2"],
+  "facts": [
+    {
+      "fact": "One atomic fact sentence",
+      "triplets": [
+        ["Entity 1", "relation", "Entity 2 or literal"]
+      ]
+    }
+  ]
+}"""
+
+        empty_example = """{"entities": [], "facts": []}"""
+
+        example_input = "The Newcomers is a 2000 film starring Chris Evans."
+        example_output = """{
+  "entities": ["The Newcomers", "Chris Evans", "2000"],
+  "facts": [
+    {
+      "fact": "The Newcomers is a 2000 film.",
+      "triplets": [
+        ["The Newcomers", "is", "2000 film"]
+      ]
+    },
+    {
+      "fact": "The Newcomers starred Chris Evans.",
+      "triplets": [
+        ["The Newcomers", "starred", "Chris Evans"]
+      ]
+    }
+  ]
+}"""
+
+        prompt = (
+            "# Role:\n"
+            "You are a structured information extractor for HotpotQA multi-hop question answering.\n"
+            "Your task is to convert a given chunk of text into structured facts that can be used for graph construction.\n\n"
+            "You must extract information only from the input text. Do not add outside knowledge, do not guess, and do not alter the meaning of the original text.\n\n"
+            "## Task:\n"
+            "Given one chunk of text, extract:\n\n"
+            "1. entities:\n"
+            "- A list of entities explicitly mentioned in the text\n"
+            "- Do not output pronouns (such as he, she, it, they, his, her, its, their)\n"
+            "- Use standard, complete, and uniquely identifiable names whenever possible\n"
+            '- Do not casually treat pure attribute words, function words, or generic category words as entities (for example, "actor", "city", and "year" are generally not entities)\n\n'
+            "2. facts:\n"
+            "- Extract one or more atomic facts\n"
+            "- Each fact must express exactly one minimal, independent, and citable fact\n"
+            "- Do not merge multiple relations into a single fact\n"
+            "- Every fact must be directly supported by the input text\n"
+            "- If the text does not contain any clear fact, do not fabricate one; return an empty list\n\n"
+            "3. triplets:\n"
+            "- Each fact must correspond to one or more triplets\n"
+            "- Each triplet must follow the format: [head, relation, tail]\n"
+            "- The head and tail should come from entities whenever possible; if not suitable as entities, use the original literal text\n"
+            '- The relation should be concise, stable, and semantically clear, preferably as a short phrase, such as: "is", "was born in", "starred", "directed by", "located in", "part of", "published in", "married to"\n'
+            "- Triplets must be strictly semantically consistent with their corresponding fact\n\n"
+            "## Important Constraints\n"
+            "- Never fabricate information that is not explicitly stated in the input text\n"
+            "- Never use background knowledge outside the input text to fill in missing information\n"
+            '- Preserve literals such as time, year, number, and title exactly as they appear, for example: "1999", "42", "president"\n'
+            "- If one sentence contains multiple facts, split them into multiple atomic facts\n"
+            "- If the relation between two entities is unclear, do not force a relation\n"
+            "- Do not output duplicate entities\n"
+            "- Do not output duplicate facts\n"
+            "- Do not output any schema, explanation, or annotation unrelated to the text\n\n"
+            "## Output Format\n"
+            "You must output exactly one strictly valid JSON object. Do not output markdown, do not output code fences, and do not output any explanatory text.\n\n"
+            "The JSON format is:\n"
+            f"{output_schema}\n\n"
+            "## Output Requirements\n"
+            '- The top level must contain exactly two keys: "entities" and "facts"\n'
+            '- "entities" must be an array of strings\n'
+            '- "facts" must be an array\n'
+            '- Each fact object must contain exactly two keys: "fact" and "triplets"\n'
+            '- "fact" must be a string\n'
+            '- "triplets" must be an array\n'
+            "- Each triplet must have length 3, and all three elements must be strings\n"
+            "- Even if nothing can be extracted, you must still output valid JSON, for example:\n"
+            f"{empty_example}\n\n"
+            "## Example\n"
+            "Input chunk:\n"
+            f"{example_input}\n\n"
+            "Output:\n"
+            f"{example_output}\n\n"
+            "## Input chunk\n"
+            f"{text}\n\n"
+            "## Output\n"
+            "Output JSON only.\n"
+        )
+
+        resp = requests.post(
+            f"{self.ollama_base_url}/api/generate",
+            json={
+                "model": self.llm_model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.0},
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+
+        raw = (resp.json() or {}).get("response", "").strip()
+        try:
+            js = self._extract_first_json_object(raw)
+            data = json.loads(js)
+        except Exception:
+            self._record_bad_llm_output(chunk_id=str(cid), raw=raw, stage="extract_facts_json_parse")
+            raise
+
+        entities = data.get("entities", [])
+        facts_list = data.get("facts", [])
+
+        if not isinstance(entities, list):
+            raise ValueError(f"LLM 返回 entities 格式不合法: chunk_id={cid}")
+        if not all(isinstance(x, str) for x in entities):
+            raise ValueError(f"LLM 返回 entities 元素存在非字符串: chunk_id={cid}")
+
+        if not isinstance(facts_list, list):
+            raise ValueError(f"LLM 返回 facts 格式不合法: chunk_id={cid}")
+
+        clean_entities: List[str] = []
+        seen_entities = set()
+        for e in entities:
+            ee = e.strip()
+            if not ee:
+                continue
+            if ee not in seen_entities:
+                clean_entities.append(ee)
+                seen_entities.add(ee)
+
+        facts: List[Dict] = []
+        seen_fact_text = set()
+
+        for idx, item in enumerate(facts_list):
+            if not isinstance(item, dict):
+                raise ValueError(f"facts[{idx}] 不是 dict: chunk_id={cid}")
+
+            fact_text = item.get("fact")
+            triplets = item.get("triplets")
+
+            if not (isinstance(fact_text, str) and fact_text.strip()):
+                continue
+            if not isinstance(triplets, list):
+                continue
+
+            fact_text = fact_text.strip()
+            if fact_text in seen_fact_text:
+                continue
+            seen_fact_text.add(fact_text)
+
+            clean_triplets = []
+            for tri in triplets:
+                if not (isinstance(tri, list) and len(tri) == 3):
+                    continue
+                h, r, t = tri
+                if not all(isinstance(x, str) and x.strip() for x in [h, r, t]):
+                    continue
+                clean_triplets.append([h.strip(), r.strip(), t.strip()])
+
+            if not clean_triplets:
+                continue
+
+            ft_low = fact_text.lower()
+            fact_entities: List[str] = []
+            for e in clean_entities:
+                if e.lower() in ft_low and e not in fact_entities:
+                    fact_entities.append(e)
+
+            for tri in clean_triplets:
+                head, _, tail = tri
+                if head in clean_entities and head not in fact_entities:
+                    fact_entities.append(head)
+                if tail in clean_entities and tail not in fact_entities:
+                    fact_entities.append(tail)
+
+            if not fact_entities:
+                continue
+
+            facts.append(
+                {
+                    "id": f"{cid}_fact_{idx}",
+                    "text": fact_text,
+                    "triplets": clean_triplets,
+                    "entity_ids": fact_entities,
+                    "source_chunk_id": cid,
+                }
+            )
+
+        return facts, clean_entities
+
+    # 4) Step 2: facts -> propositions
+    def build_proposition_nodes(self, facts: List[Dict]) -> Tuple[List[Dict], Dict[str, List[str]]]:
+        if not facts:
+            raise ValueError("facts 为空")
+
+        buckets: Dict[str, List[Dict]] = {}
+        for f in facts:
+            eids = f.get("entity_ids")
+            if not eids:
+                raise ValueError(f"fact 缺少 entity_ids: fact_id={f.get('id')}")
+            for e in eids:
+                buckets.setdefault(e, []).append(f)
+
+        if not buckets:
+            raise ValueError("按实体分桶后 buckets 为空（严格模式）")
+
+        prop_dedup: Dict[str, Dict] = {}
+        for _, bucket_facts in buckets.items():
+            seen = set()
+            uniq_texts: List[str] = []
+            all_entities: Set[str] = set()
+            fact_ids: List[str] = []
+            source_chunks: Set[str] = set()
+
+            for f in bucket_facts:
+                t = (f.get("text") or "").strip()
+                if not t:
+                    raise ValueError(f"fact text 为空: fact_id={f.get('id')}")
+
+                if t not in seen:
+                    uniq_texts.append(t)
+                    seen.add(t)
+
+                all_entities.update(f.get("entity_ids") or [])
+                if not f.get("id"):
+                    raise ValueError("fact 缺少 id")
+                fact_ids.append(f["id"])
+
+                scid = f.get("source_chunk_id")
+                if not scid:
+                    raise ValueError(f"fact 缺少 source_chunk_id: fact_id={f.get('id')}")
+                source_chunks.add(scid)
+
+            prop_text = " ".join(uniq_texts[:10]).strip()
+            if not prop_text:
+                raise ValueError("prop_text 为空（严格模式）")
+
+            dedup_key = prop_text
+            if dedup_key not in prop_dedup:
+                prop_dedup[dedup_key] = {
+                    "text": prop_text,
+                    "entity_ids": set(all_entities),
+                    "fact_ids": list(fact_ids),
+                    "source_chunk_ids": set(source_chunks),
+                }
+            else:
+                prop_dedup[dedup_key]["entity_ids"].update(all_entities)
+                prop_dedup[dedup_key]["fact_ids"].extend(fact_ids)
+                prop_dedup[dedup_key]["source_chunk_ids"].update(source_chunks)
+
+        propositions: List[Dict] = []
+        fact_assignments: Dict[str, List[str]] = {}
+
+        for prop_text, pd in prop_dedup.items():
+            pid = self._stable_prop_id(prop_text)
+
+            entity_ids = sorted({x for x in pd["entity_ids"] if isinstance(x, str) and x.strip()})
+            if not entity_ids:
+                raise ValueError(f"P 缺少 entity_ids: prop_id={pid}")
+
+            fact_ids = sorted(set(pd["fact_ids"]))
+            if not fact_ids:
+                raise ValueError(f"P 缺少 fact_ids: prop_id={pid}")
+
+            source_chunk_ids = sorted(set(pd["source_chunk_ids"]))
+            if not source_chunk_ids:
+                raise ValueError(f"P 缺少 source_chunk_ids: prop_id={pid}")
+
+            try:
+                prop_emb = self._encode_text(prop_text)
+            except Exception as e:
+                self._write_debug_file(
+                    "bad_proposition_text.txt",
+                    "=" * 100
+                    + "\n"
+                    + f"PROP_ID: {pid}\n"
+                    + f"PROP_TEXT_LEN: {len(prop_text)}\n"
+                    + f"PROP_TEXT_REPR: {repr(prop_text[:5000])}\n",
+                )
+                raise RuntimeError(
+                    f"proposition embedding 失败 | prop_id={pid} | prop_text={prop_text[:500]!r}"
+                ) from e
+
+            propositions.append(
+                {
+                    "id": pid,
+                    "text": prop_text,
+                    "entity_ids": entity_ids,
+                    "fact_ids": fact_ids,
+                    "source_chunk_ids": source_chunk_ids,
+                    "embedding": prop_emb,
+                }
+            )
+            fact_assignments[pid] = fact_ids
+
+        if not propositions:
+            raise ValueError("propositions 为空")
+        return propositions, fact_assignments
+
+    # 5) Step 3: entity -> type
+    def infer_entity_type(self, entity: str, context: str) -> str:
+        canon = self._norm_entity(entity)
+        if not canon:
+            raise ValueError("entity为空")
+
+        if canon in self.type_cache:
+            t = str(self.type_cache[canon]).strip().upper()
+            if t not in self.type_label_set:
+                raise ValueError(f"type_cache 中存在非法标签: {t} for entity={entity}")
+            self.last_type_cache_hit = True
+            self.last_type_cache_label = t
+            return t
+
+        self.last_type_cache_hit = False
+        self.last_type_cache_label = ""
+
+        labels_str = " | ".join(self.type_labels)
+        ctx = context.strip()
+        if len(ctx) > 220:
+            ctx = ctx[:220]
+
+        prompt = f"""# Role
+You are an entity type classifier for multi-hop QA evidence-graph construction.
+
+# Task
+Given:
+1. one entity string
+2. one short context snippet
+
+choose exactly one retrieval-oriented type label for the entity from the allowed labels.
+
+# Allowed labels
+{labels_str}
+
+# Labeling rules
+1. You must classify ONLY based on the given entity string and the given context.
+2. Do NOT use outside world knowledge unless it is explicitly supported by the context.
+3. PERSON: real people, historical figures, fictional characters, or named individuals.
+4. LOCATION: countries, cities, regions, natural places, facilities, buildings, venues, or geographic targets.
+5. ORGANIZATION: companies, schools, universities, government agencies, teams, parties, institutions, or groups.
+6. WORK: books, films, papers, songs, albums, law texts, software projects, artworks, websites, or named creative/document works.
+7. EVENT: wars, awards, elections, competitions, conferences, disasters, legal cases, movements, or named events.
+8. TIME: years, dates, periods, eras, dynasties, or explicit time expressions.
+9. NUMBER: counts, ranks, ages, distances, money amounts, percentages, measurements, or numeric literals.
+10. CONCEPT: concepts, methods, technologies, diseases, product categories, abstract terms, roles, genres, languages, or nationalities.
+11. OTHER: only if none of the above labels fits.
+12. If the context is insufficient or ambiguous, choose the most conservative label.
+13. Do NOT explain your reasoning.
+14. Output exactly one JSON object and nothing else.
+
+# Important boundary cases
+- film / book / paper / song / software / website / law text -> WORK
+- organization / company / award committee / school / university / government agency / team -> ORGANIZATION
+- award / war / competition / election / conference / legal case -> EVENT
+- nationality / language / occupation / role / genre -> CONCEPT
+- date / year / historical period -> TIME
+- count / age / distance / percentage / ranking / money amount -> NUMBER
+- fictional people with personal names -> PERSON
+- named places in fictional or real settings -> LOCATION
+
+# Output format
+{{"type":"<ONE_LABEL>"}}
+
+# Valid output examples
+{{"type":"PERSON"}}
+{{"type":"LOCATION"}}
+{{"type":"ORGANIZATION"}}
+{{"type":"WORK"}}
+
+# Input
+Entity: "{entity}"
+Context: "{ctx}"
+
+# Output
+Return JSON only.
+"""
+        resp = requests.post(
+            f"{self.ollama_base_url}/api/generate",
+            json={
+                "model": self.llm_model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.0, "num_predict": 40},
+            },
+            timeout=90,
+        )
+        resp.raise_for_status()
+
+        raw = (resp.json() or {}).get("response", "").strip()
+        try:
+            js = self._extract_first_json_object(raw)
+            data = json.loads(js)
+        except Exception:
+            self._record_bad_llm_output(chunk_id=f"entity::{entity}", raw=raw, stage="infer_entity_type_json_parse")
+            raise
+
+        if "type" not in data:
+            raise ValueError(f"LLM type 输出缺少 'type' 字段: entity={entity}")
+
+        t = str(data["type"]).strip().upper()
+        if t not in self.type_label_set:
+            raise ValueError(f"LLM type 输出不在允许集合内: type={t} entity={entity}")
+
+        self.type_cache[canon] = t
+        self.last_type_cache_hit = False
+        self.last_type_cache_label = t
+        if self.flush_type_cache_each_write:
+            self._save_type_cache()
+        return t
+
+    # 6) 主入口：构建 E–P–E 图
+    def build_heterogeneous_graph(self, chunks: List[Dict]) -> nx.DiGraph:
+        if not chunks:
+            raise ValueError("chunks 为空")
+
+        G = nx.DiGraph()
+
+        # ---------- (A) 加入 C 节点 ----------
+        for c in chunks:
+            cid = c.get("id")
+            if not cid:
+                raise ValueError("chunk 缺少 id")
+            if not (isinstance(c.get("text"), str) and c["text"].strip()):
+                raise ValueError(f"chunk 缺少 text: chunk_id={cid}")
+
+            if "embedding" in c and c["embedding"] is not None:
+                vec = np.asarray(c["embedding"], dtype=float).flatten()
+                if vec.shape[0] != self.embedding_dim:
+                    raise ValueError(f"chunk embedding 维度错误: chunk_id={cid}")
+                emb = vec.tolist()
+            else:
+                try:
+                    emb = self._encode_text(c["text"])
+                except Exception as e:
+                    self._write_debug_file(
+                        "bad_chunk_text.txt",
+                        "=" * 100
+                        + "\n"
+                        + f"CHUNK_ID: {cid}\n"
+                        + f"TITLE: {c.get('title')}\n"
+                        + f"SENT_IDX: {c.get('sent_idx')}\n"
+                        + f"TEXT_LEN: {len(c['text'])}\n"
+                        + f"TEXT_REPR: {repr(c['text'][:5000])}\n",
+                    )
+                    raise RuntimeError(
+                        f"chunk embedding 失败 | chunk_id={cid} | title={c.get('title')} | sent_idx={c.get('sent_idx')} | text={c['text'][:300]!r}"
+                    ) from e
+
+            G.add_node(
+                cid,
+                node_type="chunk",
+                text=c["text"],
+                embedding=emb,
+            )
+
+        # ---------- (B) 抽取 facts/entities ----------
+        all_facts: List[Dict] = []
+        entity_ctx: Dict[str, str] = {}
+
+        for c in chunks:
+            cid = c["id"]
+            facts, entities = self.extract_facts_and_entities_from_chunk(c)
+
+            for e in entities:
+                canon = self._norm_entity(e)
+                if canon and canon not in entity_ctx:
+                    entity_ctx[canon] = c["text"]
+
+            all_facts.extend(facts)
+
+            G.nodes[cid]["entity_mentions"] = entities
+            G.nodes[cid]["facts_extracted"] = facts
+
+        if not all_facts:
+            raise ValueError("全局 all_facts 为空：所有 chunk 都未抽取到可用 facts")
+
+        # ---------- (C) 构建 P 节点 ----------
+        props, _ = self.build_proposition_nodes(all_facts)
+
+        for p in props:
+            pid = p["id"]
+            G.add_node(
+                pid,
+                node_type="proposition",
+                text=p["text"],
+                embedding=p["embedding"],
+                entity_ids=p["entity_ids"],
+                fact_ids=p["fact_ids"],
+                source_chunk_ids=p["source_chunk_ids"],
+            )
+
+            for cid in p["source_chunk_ids"]:
+                if not G.has_node(cid):
+                    raise ValueError(f"P 引用了不存在的 chunk: prop_id={pid} chunk_id={cid}")
+                G.add_edge(pid, cid, edge_type="SUPPORTED_BY", weight=1.0)
+
+        # ---------- (D) 构建 E / Z 节点 ----------
+        created_entities: Set[str] = set()
+
+        for p in props:
+            pid = p["id"]
+            ent_node_ids: List[str] = []
+
+            for e in p["entity_ids"]:
+                canon = self._norm_entity(e)
+                if not canon:
+                    raise ValueError(f"实体 canonicalize 为空: entity={e} prop_id={pid}")
+
+                eid = self._entity_node_id(e)
+                ent_node_ids.append(eid)
+
+                if not G.has_node(eid):
+                    try:
+                        ent_emb = self._encode_text(canon)
+                    except Exception as ex:
+                        self._write_debug_file(
+                            "bad_entity_text.txt",
+                            "=" * 100
+                            + "\n"
+                            + f"ENTITY: {e}\n"
+                            + f"CANONICAL: {canon}\n",
+                        )
+                        raise RuntimeError(
+                            f"entity embedding 失败 | entity={e!r} | canonical={canon!r}"
+                        ) from ex
+
+                    G.add_node(
+                        eid,
+                        node_type="entity",
+                        text=e,
+                        canonical=canon,
+                        embedding=ent_emb,
+                    )
+
+                if eid not in created_entities:
+                    created_entities.add(eid)
+
+                    ctx = entity_ctx.get(canon, "")
+                    t = self.infer_entity_type(e, ctx)
+                    G.nodes[eid]["type_cache_hit"] = bool(self.last_type_cache_hit)
+                    G.nodes[eid]["type_cache_label"] = str(self.last_type_cache_label or t)
+
+                    zid = self._type_node_id(t)
+                    if not G.has_node(zid):
+                        G.add_node(zid, node_type="type", text=t)
+
+                    G.add_edge(eid, zid, edge_type="IS_A", weight=1.0)
+
+                G.add_edge(eid, pid, edge_type="INVOLVED_IN", weight=1.0)
+                G.add_edge(pid, eid, edge_type="ASSERTS", weight=1.0)
+
+            G.nodes[pid]["entity_node_ids"] = ent_node_ids
+
+        # ---------- (E) 离线结构先验 ----------
+        from src.offline_struct_prior import compute_and_write_struct_prior
+
+        sp_cfg = (self.config.get("offline_struct_prior", {}) or {})
+        compute_and_write_struct_prior(
+            G,
+            alpha_core=float(sp_cfg.get("alpha_core", 0.5)),
+            alpha_betw=float(sp_cfg.get("alpha_betw", 0.5)),
+            attr=str(sp_cfg.get("attr", "s_struct_global")),
+        )
+
+        # ---------- (F) 落盘 cache ----------
+        self._save_type_cache()
+
+        logger.info("构图完成: nodes=%d edges=%d", G.number_of_nodes(), G.number_of_edges())
+        return G
