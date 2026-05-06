@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from common import ARTIFACT_DIR, BGE_M3_MODEL_NAME, DATA_PATH, append_jsonl, ensure_artifact_dir, load_chunks, make_qa_items
-from src.bgem3_retriever import BGEM3Retriever
+from HeterGraphRAG.bgem3_retriever import BGEM3Retriever
 
 
 def hit_at_k(pred_titles: List[str], gold_titles: List[str], k: int) -> bool:
@@ -16,7 +16,7 @@ def hit_at_k(pred_titles: List[str], gold_titles: List[str], k: int) -> bool:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate coarse retrieval title recall on Hotpot chunks.")
+    parser = argparse.ArgumentParser(description="在 Hotpot chunks 上评估粗检索的标题召回率。")
     parser.add_argument("--data", default=str(DATA_PATH))
     parser.add_argument("--index-prefix", default=str(ARTIFACT_DIR / "hotpot_bgem3_index"))
     parser.add_argument("--num-queries", type=int, default=50)
@@ -37,7 +37,7 @@ def main() -> None:
     }
     retriever = BGEM3Retriever(cfg)
     if not retriever.load_index(args.index_prefix):
-        raise RuntimeError(f"Index not found: {args.index_prefix}. Run experiments/02_build_index.py first.")
+        raise RuntimeError(f"未找到索引: {args.index_prefix}。请先运行 experiments/02_build_index.py。")
 
     out_path = Path(args.out)
     if out_path.exists():
@@ -65,7 +65,7 @@ def main() -> None:
     ensure_artifact_dir()
     append_jsonl(out_path, rows)
     summary = {f"recall@{k}": v / max(1, len(qa_items)) for k, v in hits.items()}
-    print(f"Wrote {out_path}")
+    print(f"已写入 {out_path}")
     print({"num_queries": len(qa_items), **summary})
 
 

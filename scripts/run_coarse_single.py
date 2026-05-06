@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
 import json
 import logging
+import sys
 from pathlib import Path
 
-from bgem3_retriever import BGEM3Retriever
+ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from HeterGraphRAG.bgem3_retriever import BGEM3Retriever
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,7 +21,7 @@ def load_json(path):
         return json.load(f)
 
 def main():
-    base_dir = Path(__file__).resolve().parent.parent   # /home/featurize
+    base_dir = ROOT
     data_dir = base_dir / "data"
     model_dir = base_dir / "models" / "bge-m3"
 
@@ -75,8 +81,8 @@ def main():
     gold_titles = list({x[0] for x in sample["supporting_facts"]})
 
     print(f"query       = {query}")
-    print(f"gold answer = {sample['answer']}")
-    print(f"gold titles = {gold_titles}")
+    print(f"标准答案 = {sample['answer']}")
+    print(f"标准标题 = {gold_titles}")
 
     print("=" * 80)
     print("6) 执行粗检")

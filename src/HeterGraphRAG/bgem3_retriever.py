@@ -55,7 +55,7 @@ class BGEM3Retriever:
         logger.info("BGE-M3 Retriever initialized | model=%s", self.model_name)
 
     # -------------------------
-    # Model
+    # 模型
     # -------------------------
     def _load_bge_m3_model(self):
         try:
@@ -68,10 +68,10 @@ class BGEM3Retriever:
         out = self.model.encode(texts, return_dense=return_dense, return_sparse=return_sparse)
         dense_vecs = out.get("dense_vecs") if return_dense else None
         lexical_weights = out.get("lexical_weights") if return_sparse else None
-        return dense_vecs, lexical_weights  # lexical: token_id -> weight
+        return dense_vecs, lexical_weights  # 词项权重：token_id -> weight
 
     # -------------------------
-    # Index build
+    # 索引构建
     # -------------------------
     @staticmethod
     def _doc_text_from_chunks(doc: Dict[str, Any], max_chunks: int = 12, max_len: int = 2000) -> str:
@@ -142,7 +142,7 @@ class BGEM3Retriever:
 
             dense_list.append(dense_vecs)
 
-            # sparse / inverted index
+            # 稀疏检索 / 倒排索引
             if lexical_list is None:
                 lexical_list = [{} for _ in range(end - start)]
 
@@ -172,7 +172,7 @@ class BGEM3Retriever:
         )
 
     # -------------------------
-    # Save/Load
+    # 保存 / 加载
     # -------------------------
     def save_index(self, index_path: str):
         index_data = {
@@ -209,7 +209,7 @@ class BGEM3Retriever:
             return False
 
     # -------------------------
-    # Dense retrieval
+    # 稠密检索
     # -------------------------
     def _dense_retrieve(self, h_q: np.ndarray):
         if self.doc_dense_embeddings is None or len(self.documents) == 0:
@@ -237,7 +237,7 @@ class BGEM3Retriever:
         return [(int(i), float(sims[i])) for i in top_idx]
 
     # -------------------------
-    # Sparse retrieval
+    # 稀疏检索
     # -------------------------
     def _sparse_retrieve(self, s_q: Dict[Any, float]):
         if not self.inverted_index or len(self.documents) == 0:
@@ -261,7 +261,7 @@ class BGEM3Retriever:
         return [(int(doc_idx), float(score)) for doc_idx, score in items[:k]]
 
     # -------------------------
-    # Fusion
+    # 分数融合
     # -------------------------
     def _fuse_scores_rrf(self, dense_list, sparse_list):
         rrf_k = max(1, self.rrf_k)
@@ -288,7 +288,7 @@ class BGEM3Retriever:
         return items
 
     # -------------------------
-    # Public retrieval
+    # 对外检索接口
     # -------------------------
     def hybrid_doc_retrieval(self, query: str, top_k_final: Optional[int] = None):
         """

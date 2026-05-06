@@ -1,14 +1,14 @@
-# Environment Setup
+# 环境配置
 
-This project uses:
+本项目使用：
 
-- `FlagEmbedding` for BGE-M3 dense+sparse retrieval.
-- `Ollama` for LLM-based intent classification, graph construction, entity typing, semantic anchor scoring, and answer generation.
-- `networkx`, `numpy`, and `requests` for graph/ranking/runtime utilities.
+- `FlagEmbedding`：用于 BGE-M3 稠密+稀疏混合检索。
+- `Ollama`：用于基于 LLM 的意图分类、图构建、实体类型标注、语义锚点评分和答案生成。
+- `networkx`、`numpy`、`requests`：用于图处理、排序和运行时工具。
 
-## 1. Create Python Environment
+## 1. 创建 Python 环境
 
-Recommended Python version: `3.10` or `3.11`.
+推荐 Python 版本：`3.10` 或 `3.11`。
 
 ```bash
 conda create -n ksem-rag python=3.10 -y
@@ -16,28 +16,28 @@ conda activate ksem-rag
 python -m pip install --upgrade pip setuptools wheel
 ```
 
-Install dependencies:
+安装依赖：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-If your machine has CUDA, install the matching PyTorch build first or reinstall it after `requirements.txt`.
-Example for CUDA 12.1:
+如果你的机器有 CUDA，建议先安装匹配的 PyTorch 版本，或者在安装 `requirements.txt` 后重新安装 PyTorch。
+CUDA 12.1 示例：
 
 ```bash
 pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
 pip install -r requirements.txt
 ```
 
-CPU-only fallback:
+仅 CPU 环境：
 
 ```bash
 pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
 pip install -r requirements.txt
 ```
 
-## 2. Verify Python Packages
+## 2. 验证 Python 包
 
 ```bash
 python - <<'PY'
@@ -51,58 +51,58 @@ print("FlagEmbedding OK")
 PY
 ```
 
-## 3. Prepare Ollama
+## 3. 准备 Ollama
 
-Install and start Ollama according to your platform:
+根据你的平台安装并启动 Ollama：
 
 ```bash
 ollama serve
 ```
 
-In another shell, pull the models used by the default experiment config:
+在另一个终端中拉取默认实验配置使用的模型：
 
 ```bash
 ollama pull qwen2.5:14b
 ollama pull bge-m3:latest
 ```
 
-Verify Ollama:
+验证 Ollama 服务：
 
 ```bash
 curl http://localhost:11434/api/tags
 ```
 
-Verify generation:
+验证生成接口：
 
 ```bash
 curl http://localhost:11434/api/generate \
   -d '{"model":"qwen2.5:14b","prompt":"Return JSON only: {\"ok\":true}","stream":false}'
 ```
 
-Verify embedding:
+验证 embedding 接口：
 
 ```bash
 curl http://localhost:11434/api/embed \
   -d '{"model":"bge-m3:latest","input":"test embedding"}'
 ```
 
-The graph builder currently expects `embedding_dim = 1024` for `bge-m3:latest`.
+当前图构建模块要求 `bge-m3:latest` 的 `embedding_dim = 1024`。
 
-## 4. Run Experiments From Small To Large
+## 4. 按从小到大的顺序运行实验
 
-All commands below assume you are in:
+下面的命令默认你已经进入项目根目录：
 
 ```bash
 cd /home/featurize/KSEM/src
 ```
 
-Probe data:
+检查数据：
 
 ```bash
 python experiments/01_probe_data.py
 ```
 
-Build a 5-QA retrieval index:
+构建 5 个 QA 的检索索引：
 
 ```bash
 python experiments/02_build_index.py \
@@ -110,7 +110,7 @@ python experiments/02_build_index.py \
   --index-prefix experiments/artifacts/hotpot_subset_bgem3_index
 ```
 
-Evaluate coarse retrieval:
+评估粗检索：
 
 ```bash
 python experiments/03_eval_retrieval.py \
@@ -118,7 +118,7 @@ python experiments/03_eval_retrieval.py \
   --index-prefix experiments/artifacts/hotpot_subset_bgem3_index
 ```
 
-Build a 5-QA graph:
+构建 5 个 QA 的图：
 
 ```bash
 python experiments/04_build_graph_subset.py \
@@ -126,7 +126,7 @@ python experiments/04_build_graph_subset.py \
   --graph-path experiments/artifacts/hotpot_subset_graph.pkl
 ```
 
-Run one end-to-end query:
+运行一次端到端查询：
 
 ```bash
 python experiments/05_query_one.py \
@@ -135,7 +135,7 @@ python experiments/05_query_one.py \
   --graph-path experiments/artifacts/hotpot_subset_graph.pkl
 ```
 
-Run a small batch:
+运行一个小批量实验：
 
 ```bash
 python experiments/06_run_batch.py \
@@ -144,9 +144,9 @@ python experiments/06_run_batch.py \
   --graph-path experiments/artifacts/hotpot_subset_graph.pkl
 ```
 
-## 5. Scaling Plan
+## 5. 扩展实验规模
 
-After the 5-QA run is healthy:
+5 个 QA 的流程正常后，再逐步扩大规模：
 
 ```bash
 # 10 QA
@@ -160,11 +160,11 @@ python experiments/04_build_graph_subset.py --num-qa 50 --graph-path experiments
 python experiments/06_run_batch.py --num-queries 50 --index-prefix experiments/artifacts/hotpot_50_bgem3_index --graph-path experiments/artifacts/hotpot_50_graph.pkl
 ```
 
-Only move to 1000 QA after strict-methodology metadata is healthy.
+只有在严格方法论元数据健康时，才建议继续扩展到 1000 QA。
 
-## 6. Methodology Health Fields
+## 6. 方法论健康字段
 
-For paper experiments, inspect these metadata fields:
+论文实验中建议检查这些元数据字段：
 
 - `strict_methodology`
 - `entity_type_filter_candidate_count`
@@ -179,7 +179,7 @@ For paper experiments, inspect these metadata fields:
 - `type_cache_observed_entity_count`
 - `type_cache_missing_entity_count`
 
-Expected healthy strict run:
+严格模式下的健康状态通常应满足：
 
 - `legacy_intent_schema_used = False`
 - `followup_used_firsthop_evidence = True`
@@ -187,7 +187,7 @@ Expected healthy strict run:
 - `entity_type_filter_fallback_used = False`
 - `type_cache_missing_entity_count = 0`
 
-## 7. Common Failures
+## 7. 常见问题
 
 `ModuleNotFoundError: No module named 'FlagEmbedding'`
 
@@ -195,27 +195,27 @@ Expected healthy strict run:
 pip install -U FlagEmbedding
 ```
 
-Ollama connection refused:
+Ollama 连接被拒绝：
 
 ```bash
 ollama serve
 ```
 
-Missing Ollama model:
+缺少 Ollama 模型：
 
 ```bash
 ollama pull qwen2.5:14b
 ollama pull bge-m3:latest
 ```
 
-Strict graph failure because old type labels are missing:
+旧的实体类型标签缺失导致严格图构建失败：
 
-Ensure `entity_type_labels` includes:
+确保 `entity_type_labels` 包含：
 
 ```text
 PERSON, LOCATION, ORGANIZATION, WORK, EVENT, TIME, NUMBER, CONCEPT, OTHER
 ```
 
-Strict query failure because `type_cache_missing_entity_count > 0`:
+`type_cache_missing_entity_count > 0` 导致严格查询失败：
 
-You are likely loading an old graph. Rebuild the graph with `04_build_graph_subset.py`.
+你很可能加载了旧图。请用 `04_build_graph_subset.py` 重新构建图。

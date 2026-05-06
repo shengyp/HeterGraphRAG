@@ -24,7 +24,7 @@ MODULES: List[Tuple[str, str]] = [
 def check_module(import_name: str, package_name: str) -> bool:
     try:
         mod = importlib.import_module(import_name)
-        version = getattr(mod, "__version__", "unknown")
+        version = getattr(mod, "__version__", "未知")
         print(f"[OK] {package_name}: {version}")
         return True
     except Exception as exc:
@@ -33,15 +33,15 @@ def check_module(import_name: str, package_name: str) -> bool:
 
 
 def check_pip() -> None:
-    print("\n# Python")
+    print("\n# Python 环境")
     print(sys.executable)
     print(sys.version)
-    print("\n# Pip")
+    print("\n# Pip 环境")
     try:
         out = subprocess.check_output([sys.executable, "-m", "pip", "--version"], text=True)
         print(out.strip())
     except Exception as exc:
-        print(f"pip check failed: {exc!r}")
+        print(f"pip 检查失败: {exc!r}")
 
 
 def check_ollama() -> None:
@@ -51,23 +51,23 @@ def check_ollama() -> None:
         resp.raise_for_status()
         data = resp.json()
         models = [m.get("name") for m in data.get("models", [])]
-        print("[OK] Ollama reachable")
+        print("[OK] Ollama 可连接")
         print(json.dumps(models, ensure_ascii=False, indent=2))
     except Exception as exc:
-        print(f"[MISS] Ollama not reachable or not ready: {exc!r}")
+        print(f"[MISS] Ollama 无法连接或尚未就绪: {exc!r}")
 
 
 def main() -> None:
     check_pip()
-    print("\n# Python packages")
+    print("\n# Python 包")
     ok = True
     for import_name, package_name in MODULES:
         ok = check_module(import_name, package_name) and ok
     check_ollama()
     if not ok:
-        print("\nSome Python packages are missing. Run:")
+        print("\n缺少部分 Python 包。请运行：")
         print("python -m pip install -r requirements.txt")
-        print("or specifically:")
+        print("或者单独安装：")
         print("python -m pip install -U FlagEmbedding")
         raise SystemExit(1)
 

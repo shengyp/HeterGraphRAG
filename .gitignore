@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+.venv/
+venv/
+env/
+
+.env
+
+experiments/artifacts/
+data/*.pkl
+data/*.faiss
+data/*_index*

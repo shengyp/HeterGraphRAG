@@ -100,7 +100,7 @@ class IntentRepresentation:
         ctx_part = ""
         if snippets:
             ctx_block = "\n".join([f"- {s}" for s in snippets])
-            ctx_part = f"\n# Optional context (seed chunks; may be noisy)\n{ctx_block}\n"
+            ctx_part = f"\n# 可选上下文（seed chunks；可能含噪声）\n{ctx_block}\n"
 
         prompt = f"""# Role
         You are an intent classifier for a HotpotQA-style multi-hop question answering system.
@@ -190,7 +190,7 @@ class IntentRepresentation:
         js = self._extract_first_json_object(raw)
         data = json.loads(js)
 
-        # Backward-compatible parsing while the prompt/configs are being migrated.
+        # 在 prompt/configs 迁移期间保持向后兼容解析。
         has_new_schema = "reasoning_type" in data and "answer_type" in data
         has_legacy_schema = "topology" in data or "semantic" in data
         legacy_intent_schema_used = (not has_new_schema) and has_legacy_schema

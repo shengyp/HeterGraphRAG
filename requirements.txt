@@ -3,12 +3,12 @@ networkx>=3.0,<4
 requests>=2.31,<3
 tqdm>=4.66,<5
 
-# BGE-M3 hybrid dense+sparse retrieval.
-# If this install pulls a CPU-only torch but you have CUDA, reinstall torch
-# from https://pytorch.org/get-started/locally/ before running large experiments.
+# BGE-M3 稠密+稀疏混合检索。
+# 如果本次安装拉取了 CPU-only 的 torch，而你的机器有 CUDA，
+# 请在运行大规模实验前根据 https://pytorch.org/get-started/locally/ 重新安装 torch。
 FlagEmbedding>=1.2.11
 
-# Common transitive dependencies used by FlagEmbedding/BGE-M3.
+# FlagEmbedding/BGE-M3 常用的传递依赖。
 torch>=2.1
 transformers>=4.40
 sentence-transformers>=2.6

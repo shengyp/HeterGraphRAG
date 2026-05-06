@@ -8,7 +8,7 @@ from common import DATA_PATH, ARTIFACT_DIR, ensure_artifact_dir, load_chunks, ma
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Probe Hotpot chunk data before running RAG experiments.")
+    parser = argparse.ArgumentParser(description="在运行 RAG 实验前检查 Hotpot chunk 数据。")
     parser.add_argument("--data", default=str(DATA_PATH))
     parser.add_argument("--limit-chunks", type=int, default=None)
     args = parser.parse_args()
@@ -35,7 +35,7 @@ def main() -> None:
 
     out = ensure_artifact_dir() / "01_probe_data_report.json"
     write_json(out, report)
-    print(f"Wrote {out}")
+    print(f"已写入 {out}")
     print(report)
 
 

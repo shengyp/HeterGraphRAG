@@ -10,13 +10,13 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PROJECT_PARENT = ROOT.parent
+SRC_DIR = ROOT / "src"
 DATA_PATH = ROOT / "data" / "hotpot_chunks.json"
 ARTIFACT_DIR = ROOT / "experiments" / "artifacts"
 BGE_M3_MODEL_NAME = os.environ.get("BGE_M3_MODEL_NAME", "/home/featurize/bge-m3")
 
-if str(PROJECT_PARENT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_PARENT))
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 
 def ensure_artifact_dir(path: Path = ARTIFACT_DIR) -> Path:

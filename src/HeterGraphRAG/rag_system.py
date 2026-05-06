@@ -8,12 +8,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import networkx as nx
 import numpy as np
 
-from src.bgem3_retriever import BGEM3Retriever
-from src.graph_builder import GraphBuilder
-from src.intent_representation import IntentRepresentation
-from src.semantic_anchor_selector import SemanticAnchorSelector
-from src.structural_centrality_ranker import StructuralCentralityRanker
-from src.answer_generator import AnswerGenerator
+from HeterGraphRAG.bgem3_retriever import BGEM3Retriever
+from HeterGraphRAG.graph_builder import GraphBuilder
+from HeterGraphRAG.intent_representation import IntentRepresentation
+from HeterGraphRAG.semantic_anchor_selector import SemanticAnchorSelector
+from HeterGraphRAG.structural_centrality_ranker import StructuralCentralityRanker
+from HeterGraphRAG.answer_generator import AnswerGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,7 @@ class RAGSystem:
         )
 
     # -------------------------
-    # Graph I/O
+    # 图读写
     # -------------------------
     def build_global_graph(self, chunks: List[Dict[str, Any]]):
         logger.info("开始构建全局图: chunks=%d", len(chunks))
@@ -101,13 +101,13 @@ class RAGSystem:
         )
 
     # -------------------------
-    # Retriever index
+    # 检索器索引
     # -------------------------
     def index_documents(self, documents: List[Dict[str, Any]]):
         self.bgem3_retriever.build_doc_index(documents)
 
     # -------------------------
-    # Query
+    # 查询
     # -------------------------
     def query(self, query: str) -> Dict[str, Any]:
         query = query.strip()
@@ -394,7 +394,7 @@ class RAGSystem:
             merged.append(d)
         return merged
     # =========================
-    # 5.3 Query subgraph: seed C -> P -> E -> P
+    # 5.3 查询子图：seed C -> P -> E -> P
     # =========================
     def _build_query_subgraph_from_seeds(self, seed_chunk_ids: List[str]) -> Tuple[nx.DiGraph, List[str]]:
         if self.global_graph is None:
@@ -416,7 +416,7 @@ class RAGSystem:
                 if ed.get("edge_type") == "ASSERTS" and self.global_graph.nodes[nb].get("node_type") == "entity":
                     e.add(nb)
 
-        # entities -> propositions (two-hop reach)
+        # entities -> propositions（两跳可达）
         p2: Set[str] = set(p1)
         for eid in e:
             for nb in self.global_graph.successors(eid):
@@ -431,7 +431,7 @@ class RAGSystem:
         return G_q, sorted(p1)
 
     # =========================
-    # 5.5 Anchor selection
+    # 5.5 锚点选择
     # =========================
     def _select_anchor_props(self, G_q: nx.DiGraph, s_sem: Dict[str, float]) -> List[str]:
         """
@@ -492,7 +492,7 @@ class RAGSystem:
 
 
     # =========================
-    # 5.6 Intent-controlled P-E-P expansion
+    # 5.6 意图控制的 P-E-P 扩展
     # =========================
     def _entity_type_labels(self, eid: str) -> Set[str]:
         labels: Set[str] = set()
@@ -699,12 +699,12 @@ class RAGSystem:
     def _intent_controlled_expand(self, anchor_props: List[str], intent_sem: str) -> List[str]:
         expanded: Set[str] = set()
 
-        # 1) 收集并 rerank entity
+        # 1) 收集并重排 entity
         top_entity_ids, ent2anchors, ent_score_map = self._collect_and_rerank_expand_entities(
             anchor_props, intent_sem
         )
 
-        # 2) 从 top entities 往外扩 proposition，并记录来源
+        # 2) 从 top entities 往外扩展 proposition，并记录来源
         prop2sources: Dict[str, List[Tuple[str, str]]] = {}
 
         for eid in top_entity_ids:
@@ -753,7 +753,7 @@ class RAGSystem:
         return expanded_list
 
     # =========================
-    # 5.7 Evidence buckets
+    # 5.7 证据桶
     # =========================
     def _build_evidence_buckets(self, prop_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
         chunks: Set[str] = set()

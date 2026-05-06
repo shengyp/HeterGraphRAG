@@ -5,11 +5,11 @@ import argparse
 from pathlib import Path
 
 from common import ARTIFACT_DIR, DATA_PATH, default_config, ensure_artifact_dir, load_chunks, make_qa_items, select_chunks_for_qa_ids
-from src.rag_system import RAGSystem
+from HeterGraphRAG.rag_system import RAGSystem
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a small strict-methodology graph for early RAG experiments.")
+    parser = argparse.ArgumentParser(description="为早期 RAG 实验构建一个小规模严格方法论图。")
     parser.add_argument("--data", default=str(DATA_PATH))
     parser.add_argument("--num-qa", type=int, default=5)
     parser.add_argument("--strict", action="store_true", default=True)

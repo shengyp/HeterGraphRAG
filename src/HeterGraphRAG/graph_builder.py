@@ -61,7 +61,7 @@ class GraphBuilder:
                 "strict_methodology=True requires graph_construction.entity_type_labels "
                 f"to explicitly include: {sorted(missing_default_labels)}"
             )
-        # Keep old configs usable while adopting the retrieval-oriented entity taxonomy.
+        # 采用面向检索的实体分类体系，同时兼容旧配置。
         label_set.update(self.DEFAULT_ENTITY_TYPE_LABELS)
         self.type_labels: List[str] = sorted(label_set)
         if not self.type_labels:
@@ -258,7 +258,7 @@ class GraphBuilder:
         with open(self.type_cache_path, "w", encoding="utf-8") as f:
             json.dump(self.type_cache, f, ensure_ascii=False, indent=2)
 
-    # 3) Step 1: chunk -> facts & entities
+    # 3) 步骤 1：chunk -> facts & entities
     def extract_facts_and_entities_from_chunk(self, chunk: Dict) -> Tuple[List[Dict], List[str]]:
         cid = chunk.get("id")
         text = chunk.get("text")
@@ -457,7 +457,7 @@ class GraphBuilder:
 
         return facts, clean_entities
 
-    # 4) Step 2: facts -> propositions
+    # 4) 步骤 2：facts -> propositions
     def build_proposition_nodes(self, facts: List[Dict]) -> Tuple[List[Dict], Dict[str, List[str]]]:
         if not facts:
             raise ValueError("facts 为空")
@@ -566,7 +566,7 @@ class GraphBuilder:
             raise ValueError("propositions 为空")
         return propositions, fact_assignments
 
-    # 5) Step 3: entity -> type
+    # 5) 步骤 3：entity -> type
     def infer_entity_type(self, entity: str, context: str) -> str:
         canon = self._norm_entity(entity)
         if not canon:
@@ -821,7 +821,7 @@ Return JSON only.
             G.nodes[pid]["entity_node_ids"] = ent_node_ids
 
         # ---------- (E) 离线结构先验 ----------
-        from src.offline_struct_prior import compute_and_write_struct_prior
+        from HeterGraphRAG.offline_struct_prior import compute_and_write_struct_prior
 
         sp_cfg = (self.config.get("offline_struct_prior", {}) or {})
         compute_and_write_struct_prior(

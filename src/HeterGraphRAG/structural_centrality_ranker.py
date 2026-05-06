@@ -10,23 +10,23 @@ logger = logging.getLogger(__name__)
 
 class StructuralCentralityRanker:
     """
-    Query-time ranker:
-    - 读取离线写入的全局结构先验（如 s_struct_global）
-    - 可选融合语义分 s_sem
-    - 输出排序后的 proposition / entity
+    查询时排序器：
+    - 读取离线写入的全局结构先验，例如 s_struct_global。
+    - 可选融合语义分 s_sem。
+    - 输出排序后的 proposition / entity。
     """
 
     def __init__(self, cfg: Optional[Dict] = None):
         cfg = cfg or {}
 
-        # final_score = beta_struct * struct + gamma_sem * sem
+        # 最终分数 = 结构权重 * 结构分 + 语义权重 * 语义分
         self.gamma_sem = float(cfg.get("gamma_sem", 0.5))
         self.beta_struct = float(cfg.get("beta_struct", 1.0))
 
-        # 从节点哪个属性读结构分
+        # 从节点的哪个属性读取结构分。
         self.struct_attr = str(cfg.get("struct_attr", "s_struct_global"))
 
-        # 截断
+        # 排序结果截断数量。
         self.k_prop = int(cfg.get("k_prop", 12))
         self.k_ent = int(cfg.get("k_ent", 12))
 
@@ -91,7 +91,7 @@ class StructuralCentralityRanker:
         s_sem: Optional[Dict[str, float]] = None,
     ) -> Dict[str, List[Tuple[str, float, float, float]]]:
         """
-        统一接口，返回 proposition / entity 两类排序结果
+        统一接口，返回 proposition / entity 两类排序结果。
         """
         result = {
             "proposition": self.rank_propositions(graph, prop_candidates, s_sem=s_sem),

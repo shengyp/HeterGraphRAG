@@ -5,14 +5,14 @@ import argparse
 from pathlib import Path
 
 from common import ARTIFACT_DIR, BGE_M3_MODEL_NAME, DATA_PATH, chunks_to_documents, ensure_artifact_dir, load_chunks, make_qa_items, select_chunks_for_qa_ids
-from src.bgem3_retriever import BGEM3Retriever
+from HeterGraphRAG.bgem3_retriever import BGEM3Retriever
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build or rebuild the BGE-M3 document index from hotpot_chunks.json.")
+    parser = argparse.ArgumentParser(description="基于 hotpot_chunks.json 构建或重建 BGE-M3 文档索引。")
     parser.add_argument("--data", default=str(DATA_PATH))
     parser.add_argument("--limit-chunks", type=int, default=None)
-    parser.add_argument("--num-qa", type=int, default=None, help="Build an index over the first N QA groups; use this with 04_build_graph_subset.py.")
+    parser.add_argument("--num-qa", type=int, default=None, help="只使用前 N 组 QA 构建索引；通常配合 04_build_graph_subset.py 使用。")
     parser.add_argument("--model-name", default=BGE_M3_MODEL_NAME)
     parser.add_argument("--index-prefix", default=str(ARTIFACT_DIR / "hotpot_bgem3_index"))
     parser.add_argument("--batch-size", type=int, default=8)
@@ -42,7 +42,7 @@ def main() -> None:
     retriever = BGEM3Retriever(cfg)
     retriever.build_doc_index(docs)
     retriever.save_index(args.index_prefix)
-    print(f"Wrote {args.index_prefix}.pkl")
+    print(f"已写入 {args.index_prefix}.pkl")
 
 
 if __name__ == "__main__":

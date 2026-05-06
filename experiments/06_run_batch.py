@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from common import ARTIFACT_DIR, DATA_PATH, append_jsonl, chunks_to_documents, default_config, ensure_artifact_dir, load_chunks, make_qa_items
-from src.rag_system import RAGSystem
+from HeterGraphRAG.rag_system import RAGSystem
 
 
 def configure_ablation(cfg: Dict[str, Any], ablation: str) -> None:
@@ -23,11 +23,11 @@ def configure_ablation(cfg: Dict[str, Any], ablation: str) -> None:
     if ablation == "more_semantic":
         cfg["structural_centrality"]["gamma_sem"] = 1.0
         return
-    raise ValueError(f"Unknown ablation: {ablation}")
+    raise ValueError(f"未知消融实验配置: {ablation}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a small/batch end-to-end RAG experiment.")
+    parser = argparse.ArgumentParser(description="运行小规模或批量端到端 RAG 实验。")
     parser.add_argument("--data", default=str(DATA_PATH))
     parser.add_argument("--index-prefix", default=str(ARTIFACT_DIR / "hotpot_bgem3_index"))
     parser.add_argument("--graph-path", default=str(ARTIFACT_DIR / "hotpot_subset_graph.pkl"))
@@ -45,7 +45,7 @@ def main() -> None:
 
     rag = RAGSystem(cfg)
     if not rag.bgem3_retriever.load_index(args.index_prefix):
-        raise RuntimeError(f"Index not found: {args.index_prefix}. Run experiments/02_build_index.py first.")
+        raise RuntimeError(f"未找到索引: {args.index_prefix}。请先运行 experiments/02_build_index.py。")
     if not rag.bgem3_retriever.documents:
         rag.index_documents(docs)
     rag.load_global_graph(args.graph_path)
